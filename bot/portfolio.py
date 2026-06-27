@@ -10,6 +10,7 @@ from config import (
     STOP_COOLDOWN_SECONDS,
     TRADES_LOG,
 )
+from bot.risk_manager import round_stop_price
 from bot.telegram_notifier import notifier
 
 logger = logging.getLogger(__name__)
@@ -313,11 +314,11 @@ class Portfolio:
             return
 
         if direction == "long":
-            candidate = round(current_price - atr_multiplier * atr, 4)
+            candidate = round_stop_price(current_price - atr_multiplier * atr, "sell", symbol)
             if candidate <= self.trailing_stops[symbol]:
                 return
         else:
-            candidate = round(current_price + atr_multiplier * atr, 4)
+            candidate = round_stop_price(current_price + atr_multiplier * atr, "buy", symbol)
             if candidate >= self.trailing_stops[symbol]:
                 return
 
@@ -348,7 +349,7 @@ class Portfolio:
                 side=stop_side,
                 type="stop",
                 time_in_force="gtc",
-                stop_price=str(round(new_stop, 4)),
+                stop_price=str(round_stop_price(new_stop, stop_side, symbol)),
             )
             self.stop_order_ids[symbol] = order.id
             self._save_state()
@@ -400,6 +401,7 @@ class Portfolio:
         return pnl
 
     def log_daily_pnl(self):
+        """Write daily P&L snapshot to CSV. Called once per UTC calendar day."""
         try:
             account = self.api.get_account()
             equity = float(account.equity)
@@ -410,6 +412,21 @@ class Portfolio:
             with open(DAILY_PNL_LOG, "a", newline="") as f:
                 csv.writer(f).writerow([date_str, daily_pnl, round(equity, 2)])
             logger.info("Daily P&L: $%.2f | Equity: $%.2f", daily_pnl, equity)
-            notifier.daily_pnl(date_str, daily_pnl, equity)
         except Exception as exc:
             logger.error("Failed to log daily P&L: %s", exc)
+
+    def send_pnl_notification(self):
+        """Fetch live P&L from Alpaca and send a Telegram Daily P&L message.
+
+        Called on the scheduled Amsterdam-time notification ticks (09:00 and 22:00).
+        Failures are logged and never propagated so the bot loop continues.
+        """
+        try:
+            account = self.api.get_account()
+            equity = float(account.equity)
+            last_equity = float(account.last_equity)
+            daily_pnl = round(equity - last_equity, 2)
+            date_str = datetime.utcnow().date().isoformat()
+            notifier.daily_pnl(date_str, daily_pnl, equity)
+        except Exception as exc:
+            logger.error("Failed to send P&L notification: %s", exc)

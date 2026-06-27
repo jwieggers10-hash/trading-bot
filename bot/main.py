@@ -8,7 +8,8 @@ Intervals:
   Momentum        — every 1 hour,  24/7 (crypto)
   Trend Following — every 4 hours, equity market hours only
 
-Daily P&L is logged once per calendar day (UTC) on the first loop tick of each day.
+Daily P&L CSV is written once per UTC calendar day.
+Daily P&L Telegram notifications fire at 09:00 and 22:00 Europe/Amsterdam.
 """
 import csv as _csv
 import logging
@@ -30,6 +31,7 @@ from config import (
     MEAN_REVERSION_SYMBOLS,
     MOMENTUM_BREAKOUT_SYMBOLS,
     MOMENTUM_INTERVAL,
+    PNL_NOTIFY_HOURS_AMS,
     TRADES_LOG,
     TREND_FOLLOWING_SYMBOLS,
     TREND_INTERVAL,
@@ -57,6 +59,7 @@ logging.basicConfig(
 logger = logging.getLogger("main")
 
 _ET = ZoneInfo("America/New_York")
+_AMS = ZoneInfo("Europe/Amsterdam")
 
 # ------------------------------------------------------------------
 # Market hours helper
@@ -77,6 +80,19 @@ def _should_run(symbol: str, api) -> bool:
     if symbol in CRYPTO_SYMBOLS:
         return True
     return _market_is_open(api)
+
+
+def _pnl_notify_due(now_ams: datetime, notified: set) -> bool:
+    """Return True when a P&L Telegram notification should fire.
+
+    Fires at each hour in PNL_NOTIFY_HOURS_AMS (Europe/Amsterdam) but only
+    once per (date, hour) pair so repeated loop ticks within the same minute
+    do not trigger duplicate sends.
+    """
+    return (
+        now_ams.hour in PNL_NOTIFY_HOURS_AMS
+        and (now_ams.date(), now_ams.hour) not in notified
+    )
 
 
 # ------------------------------------------------------------------
@@ -179,6 +195,8 @@ def main():
     last_pnl_date: date | None = None
     last_weekly_date: date | None = None
     last_heartbeat_date: date | None = None
+    # Tracks (Amsterdam date, hour) pairs for which the P&L notification was sent.
+    pnl_notified: set[tuple[date, int]] = set()
 
     logger.info("Bot started — checking signals every 60 s")
 
@@ -203,6 +221,12 @@ def main():
             if last_heartbeat_date != et_now.date() and et_now.hour >= HEARTBEAT_HOUR_ET:
                 _send_heartbeat(api, MEAN_REVERSION_SYMBOLS)
                 last_heartbeat_date = et_now.date()
+
+            # Daily P&L Telegram notification at 09:00 and 22:00 Europe/Amsterdam
+            ams_now = datetime.now(_AMS)
+            if _pnl_notify_due(ams_now, pnl_notified):
+                portfolio.send_pnl_notification()
+                pnl_notified.add((ams_now.date(), ams_now.hour))
 
             # Mean Reversion — SPY, QQQ — every 15 min
             if now - last_mean_rev >= MEAN_REVERSION_INTERVAL:

@@ -58,3 +58,6 @@ STOP_COOLDOWN_SECONDS = 60 * 60  # block re-entry for 60 minutes after a stop-ou
 
 # Daily alive heartbeat — sent via Telegram once per day at/after this hour (America/New_York)
 HEARTBEAT_HOUR_ET = 9
+
+# Daily P&L Telegram notification schedule (Europe/Amsterdam hours, 24-hour clock)
+PNL_NOTIFY_HOURS_AMS = frozenset({9, 22})

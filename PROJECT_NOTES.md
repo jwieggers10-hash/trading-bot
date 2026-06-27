@@ -297,6 +297,27 @@ The strategy is not inherently wrong, but the chosen timeframe and instruments a
 
 ---
 
+## Fix 6 — Equity stop-price rounding (2026-06-27)
+
+Alpaca rejects equity stop orders whose `stop_price` has more than 2 decimal places (e.g. `730.5911`).
+
+**Root cause:** `RiskManager.stop_price()` returned raw ATR-subtracted values rounded to 4 dp. The strategy and portfolio submitted these directly as `str(round(stop, 4))`.
+
+**Fix:** Added `round_stop_price(price, stop_side, symbol)` in `bot/risk_manager.py`:
+- Equity symbols (no `/` in name): 2 decimal places, rounded conservatively:
+  - sell stop (protecting a long): `math.floor` — stop stays at or below intended level
+  - buy stop (protecting a short): `math.ceil` — stop stays at or above intended level
+- Crypto symbols (containing `/`): 4 decimal places unchanged
+
+Applied at all three submission points:
+- `mean_reversion._enter()` — initial stop order; rounded stop also passed to `record_entry` so in-memory trailing stop matches the broker order
+- `portfolio.update_trailing_stop()` — trailing stop candidate now stored as 2-dp for equities
+- `portfolio._replace_stop_order()` — belt-and-suspenders at the actual `submit_order` call
+
+**Tests:** 21 new tests in `tests/test_stop_price_rounding.py` (52 total, all passing).
+
+---
+
 ## Today's Progress (2026-06-23)
 
 - **Backtest finalized** — 2-year run (2024-06-23 → 2026-06-20) on SPY/QQQ mean reversion confirmed positive edge: 20.60% CAGR, 3.07 Sharpe, −5.15% max drawdown.

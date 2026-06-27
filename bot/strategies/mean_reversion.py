@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 import pandas as pd
 
 from bot.portfolio import PositionFetchError
+from bot.risk_manager import round_stop_price
 from bot.telegram_notifier import notifier
 from config import (
     MEAN_REVERSION_PERIOD,
@@ -182,6 +183,7 @@ class MeanReversionStrategy:
         # Step 2: place broker-side stop for the actual filled quantity.
         # If this fails, the position is open with no protection — close it immediately.
         stop_side = "sell" if direction == "long" else "buy"
+        rounded_stop = round_stop_price(stop, stop_side, symbol)
         try:
             stop_order = self.api.submit_order(
                 symbol=symbol,
@@ -189,7 +191,7 @@ class MeanReversionStrategy:
                 side=stop_side,
                 type="stop",
                 time_in_force="gtc",
-                stop_price=str(round(stop, 4)),
+                stop_price=str(rounded_stop),
             )
         except Exception as exc:
             logger.critical(
@@ -207,7 +209,7 @@ class MeanReversionStrategy:
                 logger.critical("%s: Emergency close also failed: %s", symbol, close_exc)
             return
 
-        self.portfolio.record_entry(symbol, direction, entry_price, filled, stop_order.id, stop)
+        self.portfolio.record_entry(symbol, direction, entry_price, filled, stop_order.id, rounded_stop)
         notifier.trade_entry_filled(symbol, direction, filled, entry_price, stop)
         notifier.stop_order_submitted(symbol, stop_side, filled, stop)
         logger.info(

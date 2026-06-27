@@ -1,7 +1,26 @@
 import logging
+import math
+
 import pandas as pd
 import numpy as np
 from config import ATR_PERIOD, CAPITAL_PER_SYMBOL, RISK_PER_TRADE
+
+
+def round_stop_price(price: float, stop_side: str, symbol: str) -> float:
+    """Round a stop price to the precision Alpaca requires for the instrument.
+
+    Equities accept at most 2 decimal places.  Round conservatively so the stop
+    remains on the protective side of the intended price:
+    - sell stop (protecting a long): floor to 2 dp — stop sits at or below intent
+    - buy stop  (protecting a short): ceil to 2 dp — stop sits at or above intent
+
+    Crypto symbols (containing '/') are rounded to 4 decimal places.
+    """
+    if "/" in symbol:
+        return round(price, 4)
+    if stop_side == "sell":
+        return math.floor(price * 100) / 100
+    return math.ceil(price * 100) / 100
 
 logger = logging.getLogger(__name__)
 
