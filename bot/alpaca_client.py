@@ -57,6 +57,20 @@ class REST:
     def cancel_order(self, order_id):
         self._trading.cancel_order_by_id(order_id)
 
+    def list_orders(self, status="open", symbols=None):
+        from alpaca.trading.requests import GetOrdersRequest
+        from alpaca.trading.enums import QueryOrderStatus
+        status_map = {
+            "open":   QueryOrderStatus.OPEN,
+            "closed": QueryOrderStatus.CLOSED,
+            "all":    QueryOrderStatus.ALL,
+        }
+        req = GetOrdersRequest(
+            status=status_map.get(status, QueryOrderStatus.OPEN),
+            symbols=symbols,
+        )
+        return self._trading.get_orders(req)
+
     def close_position(self, symbol):
         return self._trading.close_position(symbol_or_asset_id=symbol)
 

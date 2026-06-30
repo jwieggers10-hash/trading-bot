@@ -221,9 +221,26 @@ class MeanReversionV2:
         from bot.strategies.mean_reversion import _filled_qty, _fill_price
         filled      = _filled_qty(order, size)
         entry_price = _fill_price(order, self.api, symbol)
+        if entry_price <= 0:
+            # Alpaca paper-trading returns orders before they settle; filled_avg_price is
+            # sometimes None and get_latest_trade may also fail.  Fall back to the signal
+            # price so that record_entry() stores a non-zero cost basis, preventing
+            # get_locked_notional() from undercounting deployed capital for later symbols.
+            entry_price = est_price
+            logger.warning(
+                "%s: fill price unavailable from broker — using signal price %.4f "
+                "for locked-capital accounting",
+                symbol, est_price,
+            )
 
         stop_side    = "sell" if direction == "long" else "buy"
         rounded_stop = round_stop_price(stop, stop_side, symbol)
+
+        # Cancel any lingering stop orders before placing the new one.
+        # Prevents Alpaca error 40310000 (wash-trade) from a prior position's
+        # stop that was not cleaned up due to a silent cancel failure or bot crash.
+        self.portfolio.cancel_open_stop_orders(symbol, stop_side)
+
         try:
             stop_order = self.api.submit_order(
                 symbol=symbol,
@@ -265,12 +282,19 @@ class MeanReversionV2:
     def _close(self, symbol: str, direction: str,
                current_price: float, reason: str = "sma_exit"):
         try:
+            stop_side = "sell" if direction == "long" else "buy"
+            # Cancel tracked stop order before closing to avoid double-fill.
             stop_id = self.portfolio.stop_order_ids.get(symbol)
             if stop_id:
                 try:
                     self.api.cancel_order(stop_id)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning(
+                        "%s: Could not cancel stop order %s before close: %s",
+                        symbol, stop_id, exc,
+                    )
+            # Sweep for any untracked stops so they cannot fill against the flat position.
+            self.portfolio.cancel_open_stop_orders(symbol, stop_side)
 
             self.api.close_position(symbol)
             entry_price = self.portfolio.entry_prices.get(symbol, current_price)

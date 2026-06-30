@@ -341,19 +341,65 @@ class Portfolio:
         self._replace_stop_order(symbol, candidate, direction)
         self._save_state()
 
+    def cancel_open_stop_orders(self, symbol: str, side: str) -> int:
+        """Cancel all open stop/stop_limit orders for *symbol* on *side*.
+
+        Returns the number of orders cancelled. Called before placing any new
+        protective stop to prevent Alpaca error 40310000 (wash-trade detection)
+        from a lingering opposite-side order that was not cleaned up — for
+        example when a prior cancel_order call failed silently, or the bot
+        crashed between cancellation and position close.
+        """
+        try:
+            open_orders = self.api.list_orders(status="open", symbols=[symbol])
+        except Exception as exc:
+            logger.error(
+                "%s: Cannot list open orders for pre-placement sweep (side=%s): %s",
+                symbol, side, exc,
+            )
+            return 0
+
+        cancelled = 0
+        for order in open_orders:
+            raw_type = getattr(order, "type", "")
+            raw_side = getattr(order, "side", "")
+            order_type = (raw_type.value if hasattr(raw_type, "value") else str(raw_type)).lower()
+            order_side = (raw_side.value if hasattr(raw_side, "value") else str(raw_side)).lower()
+            if order_type in ("stop", "stop_limit") and order_side == side:
+                try:
+                    self.api.cancel_order(order.id)
+                    cancelled += 1
+                    logger.info(
+                        "%s: Pre-placement sweep — cancelled existing %s stop %s",
+                        symbol, side, order.id,
+                    )
+                    if self.stop_order_ids.get(symbol) == order.id:
+                        self.stop_order_ids.pop(symbol, None)
+                except Exception as exc:
+                    logger.warning(
+                        "%s: Could not cancel stop %s during pre-placement sweep: %s",
+                        symbol, order.id, exc,
+                    )
+
+        return cancelled
+
     def _replace_stop_order(self, symbol: str, new_stop: float, direction: str):
+        stop_side = "sell" if direction == "long" else "buy"
+
         old_id = self.stop_order_ids.get(symbol)
         if old_id:
             try:
                 self.api.cancel_order(old_id)
             except Exception as exc:
-                logger.warning("Could not cancel old stop order %s: %s", old_id, exc)
+                logger.warning("Could not cancel tracked stop order %s: %s", old_id, exc)
+
+        # Sweep for any untracked stops to prevent 40310000 on the replacement.
+        self.cancel_open_stop_orders(symbol, stop_side)
 
         size = abs(self.entry_sizes.get(symbol, 0))
         if size == 0:
             return
 
-        stop_side = "sell" if direction == "long" else "buy"
         try:
             order = self.api.submit_order(
                 symbol=symbol,
