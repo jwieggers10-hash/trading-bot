@@ -7,6 +7,7 @@ Exit: price returns to the SMA
 Stop: hard stop at 1 ATR below (long) or above (short) entry price
 """
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
@@ -177,6 +178,13 @@ class MeanReversionStrategy:
 
         notifier.trade_entry_submitted(symbol, side, size, est_price)
 
+        # For short entries (market SELL + BUY STOP), Alpaca's wash-trade detection
+        # (error 40310000) fires when an open SELL order coexists with a new BUY order.
+        # Wait for the market fill before placing the protective stop. Long entries are
+        # unaffected — a SELL STOP on a long is a recognized protective pattern.
+        if direction == "short":
+            order = _wait_for_fill(order, self.api, symbol)
+
         filled = _filled_qty(order, size)
         entry_price = _fill_price(order, self.api, symbol)
         if entry_price <= 0:
@@ -273,6 +281,31 @@ def _flatten(bars_df: pd.DataFrame, symbol: str) -> pd.DataFrame:
     if isinstance(bars_df.index, pd.MultiIndex):
         return bars_df.xs(symbol, level=0)
     return bars_df
+
+
+def _wait_for_fill(
+    order, api, symbol: str, timeout: float = 10.0, poll_interval: float = 0.5
+) -> object:
+    """Poll until *order* is filled (or terminal) or *timeout* seconds pass.
+
+    Returns the most recently fetched order object. Used before placing a BUY
+    STOP for a short entry to close the race window that triggers Alpaca error
+    40310000 (wash-trade: open SELL market order + new BUY order).
+    """
+    _TERMINAL = frozenset({"filled", "canceled", "expired", "rejected", "done_for_day"})
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        raw = getattr(order, "status", None)
+        status_str = (raw.value if hasattr(raw, "value") else str(raw)).lower()
+        if status_str in _TERMINAL:
+            return order
+        time.sleep(poll_interval)
+        try:
+            order = api.get_order(order.id)
+        except Exception:
+            return order
+    logger.warning("%s: _wait_for_fill timed out after %.0fs — proceeding anyway", symbol, timeout)
+    return order
 
 
 def _fill_price(order, api, symbol: str) -> float:

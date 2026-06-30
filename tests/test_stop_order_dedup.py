@@ -1,5 +1,7 @@
 """Tests reproducing Alpaca error 40310000 (wash-trade) and verifying the fix.
 
+Short-position stop tests are in TestShortPositionStop at the bottom of this file.
+
 The bug: _enter() submitted a market order and then immediately submitted a
 stop order on the opposite side.  If a previous trade's stop order was not
 properly cleaned up (silent exception in _close(), bot crash between cancel and
@@ -38,12 +40,14 @@ def _make_order(
     id: str = "order-1",
     filled_avg_price: str | None = "520.00",
     filled_qty: str | None = "136",
+    status: str = "filled",
 ):
     o = MagicMock()
     o.id = id
     o.filled_avg_price = filled_avg_price
     o.filled_qty = filled_qty
     o.limit_price = None
+    o.status = status  # plain string so _wait_for_fill can compare without .value
     return o
 
 
@@ -501,3 +505,167 @@ class TestV2EnterDedup:
 
         assert portfolio.entry_prices.get("SPY") == 520.0
         assert portfolio.stop_order_ids.get("SPY") == "stop-v2"
+
+
+# ---------------------------------------------------------------------------
+# TestShortPositionStop — short entries get BUY stops without 40310000
+#
+# Root cause of the original failure:
+#   For short entries (market SELL + BUY STOP), Alpaca's wash-trade detection
+#   fires when the market SELL order is still in "new"/"accepted" state when
+#   the BUY STOP is submitted.  The existing cancel_open_stop_orders sweep
+#   only removes stop-type orders — it does not cancel the entry market order
+#   itself, and cannot.  The fix is _wait_for_fill(), which polls the entry
+#   order until it transitions to "filled" before placing the protective stop.
+#
+#   Long entries (market BUY + SELL STOP) are unaffected because Alpaca
+#   recognises a SELL STOP on a long as a protective order, not a wash trade.
+# ---------------------------------------------------------------------------
+
+class TestShortPositionStop:
+    def test_short_spy_gets_buy_stop(self, strategy, api, portfolio):
+        """Short SPY: market sell is followed by a buy stop on the correct side."""
+        api.list_orders.return_value = []
+        api.submit_order.side_effect = [
+            _make_order(id="mkt-sell-spy", filled_avg_price="520.00", filled_qty="136"),
+            _make_order(id="buy-stop-spy"),
+        ]
+
+        strategy._enter("SPY", "sell", "short", 136, 522.0)
+
+        stop_kwargs = api.submit_order.call_args_list[1].kwargs
+        assert stop_kwargs["side"] == "buy"
+        assert portfolio.stop_order_ids.get("SPY") == "buy-stop-spy"
+
+    def test_short_qqq_gets_buy_stop(self, strategy, api, portfolio):
+        """Short QQQ: market sell is followed by a buy stop."""
+        api.list_orders.return_value = []
+        api.submit_order.side_effect = [
+            _make_order(id="mkt-sell-qqq", filled_avg_price="430.00", filled_qty="100"),
+            _make_order(id="buy-stop-qqq"),
+        ]
+
+        strategy._enter("QQQ", "sell", "short", 100, 433.0)
+
+        stop_kwargs = api.submit_order.call_args_list[1].kwargs
+        assert stop_kwargs["side"] == "buy"
+        assert portfolio.stop_order_ids.get("QQQ") == "buy-stop-qqq"
+
+    def test_long_gld_gets_sell_stop(self, strategy, api, portfolio):
+        """Long GLD: market buy is followed by a sell stop."""
+        api.list_orders.return_value = []
+        api.submit_order.side_effect = [
+            _make_order(id="mkt-buy-gld", filled_avg_price="180.00", filled_qty="55"),
+            _make_order(id="sell-stop-gld"),
+        ]
+
+        strategy._enter("GLD", "buy", "long", 55, 178.0)
+
+        stop_kwargs = api.submit_order.call_args_list[1].kwargs
+        assert stop_kwargs["side"] == "sell"
+        assert portfolio.stop_order_ids.get("GLD") == "sell-stop-gld"
+
+    def test_short_entry_stop_price_above_entry(self, strategy, api, portfolio):
+        """Stop price for a short must be above the entry price (buy-to-cover)."""
+        entry_price = 520.0
+        stop_price  = 523.0   # above entry → correct for short
+        api.list_orders.return_value = []
+        api.submit_order.side_effect = [
+            _make_order(id="mkt-sell", filled_avg_price=str(entry_price), filled_qty="136"),
+            _make_order(id="buy-stop"),
+        ]
+
+        strategy._enter("SPY", "sell", "short", 136, stop_price)
+
+        stop_kwargs = api.submit_order.call_args_list[1].kwargs
+        assert float(stop_kwargs["stop_price"]) > entry_price
+
+    def test_long_entry_stop_price_below_entry(self, strategy, api, portfolio):
+        """Stop price for a long must be below the entry price."""
+        entry_price = 520.0
+        stop_price  = 517.0   # below entry → correct for long
+        api.list_orders.return_value = []
+        api.submit_order.side_effect = [
+            _make_order(id="mkt-buy", filled_avg_price=str(entry_price), filled_qty="136"),
+            _make_order(id="sell-stop"),
+        ]
+
+        strategy._enter("SPY", "buy", "long", 136, stop_price)
+
+        stop_kwargs = api.submit_order.call_args_list[1].kwargs
+        assert float(stop_kwargs["stop_price"]) < entry_price
+
+    @patch("time.sleep")
+    def test_short_polls_until_filled_before_stop(self, mock_sleep, strategy, api, portfolio):
+        """_wait_for_fill polls get_order when status is not yet 'filled'."""
+        accepted = _make_order(id="mkt-sell", filled_avg_price=None, filled_qty=None,
+                               status="accepted")
+        filled   = _make_order(id="mkt-sell", filled_avg_price="520.00", filled_qty="136",
+                               status="filled")
+        stop_order = _make_order(id="buy-stop")
+
+        api.submit_order.side_effect = [accepted, stop_order]
+        api.get_order.return_value = filled
+        api.list_orders.return_value = []
+
+        strategy._enter("SPY", "sell", "short", 136, 522.0)
+
+        api.get_order.assert_called_with(accepted.id)
+        mock_sleep.assert_called()
+        assert portfolio.stop_order_ids.get("SPY") == "buy-stop"
+
+    def test_long_does_not_poll_for_fill(self, strategy, api, portfolio):
+        """Long entries skip _wait_for_fill entirely — no get_order calls."""
+        api.list_orders.return_value = []
+        api.submit_order.side_effect = [
+            _make_order(id="mkt-buy", filled_avg_price="520.00", filled_qty="136"),
+            _make_order(id="sell-stop"),
+        ]
+
+        strategy._enter("SPY", "buy", "long", 136, 518.0)
+
+        api.get_order.assert_not_called()
+
+    def test_no_duplicate_stop_submitted_for_short(self, strategy, api, portfolio):
+        """Only one stop order is submitted per short entry (no duplicates)."""
+        api.list_orders.return_value = []
+        api.submit_order.side_effect = [
+            _make_order(id="mkt-sell"),
+            _make_order(id="buy-stop"),
+        ]
+
+        strategy._enter("SPY", "sell", "short", 136, 522.0)
+
+        stop_submits = [
+            c for c in api.submit_order.call_args_list
+            if c.kwargs.get("type") == "stop"
+        ]
+        assert len(stop_submits) == 1
+
+    def test_v2_short_spy_gets_buy_stop(self, strategy_v2, api, portfolio):
+        """MeanReversionV2: short SPY also gets a buy stop."""
+        api.list_orders.return_value = []
+        api.submit_order.side_effect = [
+            _make_order(id="mkt-sell-v2", filled_avg_price="520.00", filled_qty="136"),
+            _make_order(id="buy-stop-v2"),
+        ]
+
+        strategy_v2._enter("SPY", "sell", "short", 136, 522.0)
+
+        stop_kwargs = api.submit_order.call_args_list[1].kwargs
+        assert stop_kwargs["side"] == "buy"
+        assert portfolio.stop_order_ids.get("SPY") == "buy-stop-v2"
+
+    def test_v2_short_qqq_gets_buy_stop(self, strategy_v2, api, portfolio):
+        """MeanReversionV2: short QQQ also gets a buy stop."""
+        api.list_orders.return_value = []
+        api.submit_order.side_effect = [
+            _make_order(id="mkt-sell-qqq-v2", filled_avg_price="430.00", filled_qty="100"),
+            _make_order(id="buy-stop-qqq-v2"),
+        ]
+
+        strategy_v2._enter("QQQ", "sell", "short", 100, 433.0)
+
+        stop_kwargs = api.submit_order.call_args_list[1].kwargs
+        assert stop_kwargs["side"] == "buy"
+        assert portfolio.stop_order_ids.get("QQQ") == "buy-stop-qqq-v2"

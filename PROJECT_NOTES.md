@@ -297,6 +297,68 @@ The strategy is not inherently wrong, but the chosen timeframe and instruments a
 
 ---
 
+## Fix 8 — Short-position protective stops failing with error 40310000 (2026-06-30)
+
+**Affected symbols:** SPY short, QQQ short  
+**Unaffected:** GLD long, USO long
+
+### Symptom
+
+On the first paper-trading session with all four MR V2 symbols:
+
+- GLD long → market BUY filled → SELL STOP placed ✓  
+- SPY short → market SELL filled → BUY STOP rejected with 40310000 ✗  
+- QQQ short → market SELL filled → BUY STOP rejected with 40310000 ✗  
+
+### Root cause
+
+Alpaca's wash-trade detection fires when an open SELL order coexists with a new BUY
+order for the same symbol. For a short entry:
+
+1. `_enter()` submits a market SELL → Alpaca accepts it; status = "new"/"accepted"
+2. `cancel_open_stop_orders(symbol, "buy")` runs → finds no BUY stops (correct)
+3. `_enter()` submits a BUY STOP → Alpaca sees open SELL + new BUY = **wash trade** → 40310000
+
+**Why GLD worked:** For a long entry (market BUY + SELL STOP), Alpaca recognises a
+SELL STOP on an owned position as a standard protective closing order and does not
+trigger wash-trade detection. This asymmetry is intentional in Alpaca's design.
+
+The existing `cancel_open_stop_orders` sweep only removes stop-type orders; it cannot
+cancel the entry market order itself (which is the conflicting order for shorts).
+
+### Fix
+
+Added `_wait_for_fill(order, api, symbol)` to `bot/strategies/mean_reversion.py`
+(shared helpers section). It polls `api.get_order(order.id)` until the order reaches
+a terminal status ("filled", "canceled", "expired", "rejected", "done_for_day") or a
+10-second timeout. Added `get_order()` to `bot/alpaca_client.py`.
+
+`_enter()` in both `mean_reversion.py` and `mean_reversion_v2.py` now calls this for
+short entries only, between the market order submission and the stop order submission:
+
+```python
+if direction == "short":
+    order = _wait_for_fill(order, self.api, symbol)
+```
+
+This eliminates the race window. When the stop is submitted, the market SELL is already
+"filled" (no longer an open order), so 40310000 cannot fire.
+
+As a bonus, the refreshed order object from `get_order()` may contain `filled_avg_price`,
+reducing reliance on the `est_price` fallback for locked-capital accounting.
+
+**Tests:** 10 new tests in `TestShortPositionStop` in `tests/test_stop_order_dedup.py`.
+
+---
+
+## Fix 7 — V2 capital allocation: fill-price-zero causes locked-notional undercount (2026-06-29)
+
+See the "Fill-price-zero causes capital undercount in Strategy V2" section in the
+failure-mode review above. Applied to both `mean_reversion.py` and `mean_reversion_v2.py`.
+Added 26 tests in `tests/test_v2_capital_allocation.py`.
+
+---
+
 ## Fix 6 — Equity stop-price rounding (2026-06-27)
 
 Alpaca rejects equity stop orders whose `stop_price` has more than 2 decimal places (e.g. `730.5911`).

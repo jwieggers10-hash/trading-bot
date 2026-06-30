@@ -71,6 +71,9 @@ class REST:
         )
         return self._trading.get_orders(req)
 
+    def get_order(self, order_id):
+        return self._trading.get_order_by_id(str(order_id))
+
     def close_position(self, symbol):
         return self._trading.close_position(symbol_or_asset_id=symbol)
 

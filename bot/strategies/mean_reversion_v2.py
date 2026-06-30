@@ -218,7 +218,15 @@ class MeanReversionV2:
 
         notifier.trade_entry_submitted(symbol, side, size, est_price)
 
-        from bot.strategies.mean_reversion import _filled_qty, _fill_price
+        from bot.strategies.mean_reversion import _filled_qty, _fill_price, _wait_for_fill
+
+        # For short entries (market SELL + BUY STOP), Alpaca's wash-trade detection
+        # (error 40310000) fires when an open SELL order coexists with a new BUY order.
+        # Wait for the market fill before placing the protective stop. Long entries are
+        # unaffected — a SELL STOP on a long is a recognized protective pattern.
+        if direction == "short":
+            order = _wait_for_fill(order, self.api, symbol)
+
         filled      = _filled_qty(order, size)
         entry_price = _fill_price(order, self.api, symbol)
         if entry_price <= 0:
