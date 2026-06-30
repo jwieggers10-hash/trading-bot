@@ -138,7 +138,8 @@ def _fetch_crypto(api, symbol: str, timeframe: str, start: str, end: str) -> pd.
 # ---------------------------------------------------------------------------
 
 def backtest_mean_reversion(
-    api, symbol: str, start: str, end: str, initial_equity: float
+    api, symbol: str, start: str, end: str, initial_equity: float,
+    custom_thresholds: dict | None = None,
 ) -> list[Trade]:
     """
     Entry:  close < lower band (long) or close > upper band (short).
@@ -158,7 +159,8 @@ def backtest_mean_reversion(
     closes = bars["close"]
     sma = closes.rolling(MEAN_REVERSION_PERIOD).mean()
     std = closes.rolling(MEAN_REVERSION_PERIOD).std()
-    threshold = STD_DEV_THRESHOLDS.get(symbol, 1.5)
+    thresholds = custom_thresholds if custom_thresholds is not None else STD_DEV_THRESHOLDS
+    threshold = thresholds.get(symbol, 1.5)
     upper = sma + threshold * std
     lower = sma - threshold * std
 
@@ -852,6 +854,10 @@ def main() -> None:
                         help="Backtest end date YYYY-MM-DD (default: 3 days ago)")
     parser.add_argument("--equity", type=float, default=100_000.0,
                         help="Starting equity per symbol (default: 100000)")
+    parser.add_argument("--spy-std", type=float, default=None,
+                        help="Override SPY std-dev threshold (default: from config)")
+    parser.add_argument("--qqq-std", type=float, default=None,
+                        help="Override QQQ std-dev threshold (default: from config)")
     args = parser.parse_args()
 
     if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
@@ -861,6 +867,14 @@ def main() -> None:
     api = tradeapi.REST(ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL, api_version="v2")
     initial_equity = args.equity
     start, end = args.start, args.end
+
+    custom_thresholds: dict | None = None
+    if args.spy_std is not None or args.qqq_std is not None:
+        custom_thresholds = dict(STD_DEV_THRESHOLDS)
+        if args.spy_std is not None:
+            custom_thresholds["SPY"] = args.spy_std
+        if args.qqq_std is not None:
+            custom_thresholds["QQQ"] = args.qqq_std
     n_days = (datetime.strptime(end, "%Y-%m-%d") - datetime.strptime(start, "%Y-%m-%d")).days
 
     print(f"\n{'=' * 56}")
@@ -868,10 +882,15 @@ def main() -> None:
     print(f"{'=' * 56}")
 
     # --- Mean Reversion (SPY / QQQ) only ---
-    print("\nMean Reversion (SPY / QQQ)")
+    if custom_thresholds:
+        thr_display = ", ".join(f"{k}={v}" for k, v in custom_thresholds.items())
+        print(f"\nMean Reversion (SPY / QQQ)  [custom thresholds: {thr_display}]")
+    else:
+        print("\nMean Reversion (SPY / QQQ)")
     trades: list[Trade] = []
     for sym in MEAN_REVERSION_SYMBOLS:
-        trades.extend(backtest_mean_reversion(api, sym, start, end, initial_equity))
+        trades.extend(backtest_mean_reversion(api, sym, start, end, initial_equity,
+                                              custom_thresholds=custom_thresholds))
     total_equity = initial_equity * len(MEAN_REVERSION_SYMBOLS)
     m = _compute_metrics(trades, total_equity, n_days)
     _print_strategy_table(

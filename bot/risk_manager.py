@@ -72,6 +72,18 @@ class RiskManager:
             return 0
         return min(atr_size, int(cap / price))
 
+    def v2_position_size(self, atr: float, total_equity: float,
+                         price: float, max_notional: float,
+                         risk_pct: float) -> int:
+        """Strategy 2.0 sizing: 1 ATR adverse move = risk_pct × total_equity,
+        capped so notional <= max_notional (dynamic per-symbol allocation)."""
+        if atr <= 0 or price <= 0 or max_notional <= 0:
+            return 0
+        atr_shares = int((total_equity * risk_pct) / atr)
+        if atr_shares <= 0:
+            return 0
+        return min(atr_shares, int(max_notional / price))
+
     def stop_price(self, direction: str, entry_price: float, atr: float) -> float:
         """Hard stop at exactly 1 ATR from entry (1% equity by construction)."""
         if direction == "long":

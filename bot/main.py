@@ -31,7 +31,9 @@ from config import (
     MEAN_REVERSION_SYMBOLS,
     MOMENTUM_BREAKOUT_SYMBOLS,
     MOMENTUM_INTERVAL,
+    MR_V2_SYMBOLS,
     PNL_NOTIFY_HOURS_AMS,
+    STRATEGY_VERSION,
     TRADES_LOG,
     TREND_FOLLOWING_SYMBOLS,
     TREND_INTERVAL,
@@ -39,6 +41,7 @@ from config import (
 from bot.portfolio import Portfolio
 from bot.risk_manager import RiskManager
 from bot.strategies.mean_reversion import MeanReversionStrategy
+from bot.strategies.mean_reversion_v2 import MeanReversionV2
 from bot.strategies.momentum_breakout import MomentumBreakoutStrategy
 from bot.strategies.trend_following import TrendFollowingStrategy
 from bot.telegram_notifier import notifier
@@ -173,20 +176,28 @@ def main():
         logger.critical("Cannot reach Alpaca API: %s", exc)
         sys.exit(1)
 
+    startup_symbols = MR_V2_SYMBOLS if STRATEGY_VERSION == 2 else MEAN_REVERSION_SYMBOLS
     notifier.startup(
         account_id=account.id,
         equity=float(account.equity),
         account_status=account.status,
         base_url=ALPACA_BASE_URL,
-        symbols=MEAN_REVERSION_SYMBOLS,
+        symbols=startup_symbols,
     )
 
     risk_manager = RiskManager(api)
     portfolio = Portfolio(api)
 
-    mean_rev = MeanReversionStrategy(api, risk_manager, portfolio)
-    momentum = MomentumBreakoutStrategy(api, risk_manager, portfolio)
-    trend = TrendFollowingStrategy(api, risk_manager, portfolio)
+    mean_rev    = MeanReversionStrategy(api, risk_manager, portfolio)
+    mean_rev_v2 = MeanReversionV2(api, risk_manager, portfolio)
+    momentum    = MomentumBreakoutStrategy(api, risk_manager, portfolio)
+    trend       = TrendFollowingStrategy(api, risk_manager, portfolio)
+
+    active_symbols = MR_V2_SYMBOLS if STRATEGY_VERSION == 2 else MEAN_REVERSION_SYMBOLS
+    logger.info(
+        "Strategy version: %d | Active symbols: %s",
+        STRATEGY_VERSION, ", ".join(active_symbols),
+    )
 
     # Timestamps of last run for each strategy group
     last_mean_rev: float = 0.0
@@ -219,7 +230,7 @@ def main():
             # Daily heartbeat at/after 09:00 ET (once per ET calendar day)
             et_now = datetime.now(_ET)
             if last_heartbeat_date != et_now.date() and et_now.hour >= HEARTBEAT_HOUR_ET:
-                _send_heartbeat(api, MEAN_REVERSION_SYMBOLS)
+                _send_heartbeat(api, active_symbols)
                 last_heartbeat_date = et_now.date()
 
             # Daily P&L Telegram notification at 09:00 and 22:00 Europe/Amsterdam
@@ -228,14 +239,24 @@ def main():
                 portfolio.send_pnl_notification()
                 pnl_notified.add((ams_now.date(), ams_now.hour))
 
-            # Mean Reversion — SPY, QQQ — every 15 min
+            # Mean Reversion — every 15 min (equity market hours only)
             if now - last_mean_rev >= MEAN_REVERSION_INTERVAL:
-                for sym in MEAN_REVERSION_SYMBOLS:
-                    if _should_run(sym, api):
-                        logger.info("--- Mean Reversion: %s ---", sym)
-                        mean_rev.run(sym)
+                if STRATEGY_VERSION == 2:
+                    # Strategy 2.0 — SPY, QQQ, GLD, USO — pooled capital, dynamic sizing
+                    if _market_is_open(api):
+                        for sym in MR_V2_SYMBOLS:
+                            logger.info("--- Mean Reversion v2: %s ---", sym)
+                            mean_rev_v2.run(sym)
                     else:
-                        logger.debug("%s: market closed, skipping mean reversion", sym)
+                        logger.debug("Market closed — skipping Strategy 2.0 tick")
+                else:
+                    # Strategy 1.0 — SPY, QQQ only
+                    for sym in MEAN_REVERSION_SYMBOLS:
+                        if _should_run(sym, api):
+                            logger.info("--- Mean Reversion: %s ---", sym)
+                            mean_rev.run(sym)
+                        else:
+                            logger.debug("%s: market closed, skipping mean reversion", sym)
                 last_mean_rev = now
 
             # Momentum Breakout (BTC/USD) — DISABLED: negative expectation in backtest

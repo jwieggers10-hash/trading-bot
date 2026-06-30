@@ -270,6 +270,18 @@ class Portfolio:
     # Position state management
     # ------------------------------------------------------------------
 
+    def get_locked_notional(self, exclude_symbol: str | None = None) -> float:
+        """Return the total entry-notional locked in all tracked open positions.
+
+        exclude_symbol: skip this symbol (use when sizing a new entry for it,
+        so you're not counting the position you're about to replace).
+        """
+        return sum(
+            self.entry_prices[sym] * abs(self.entry_sizes.get(sym, 0.0))
+            for sym in self.entry_prices
+            if sym != exclude_symbol
+        )
+
     def record_entry(
         self,
         symbol: str,

@@ -14,6 +14,11 @@ ENVIRONMENT = os.getenv("ENVIRONMENT", "paper").lower()
 # Set to "false" to silence Telegram without removing the token from .env.
 TELEGRAM_ENABLED = os.getenv("TELEGRAM_ENABLED", "true").lower() == "true"
 
+# Strategy selector — set STRATEGY_VERSION=2 in .env to run Strategy 2.0
+# 1 = original SPY/QQQ mean reversion (2 symbols, fixed cap)
+# 2 = pooled SPY/QQQ/GLD/USO mean reversion (4 symbols, dynamic cap, 0.25% risk)
+STRATEGY_VERSION = int(os.getenv("STRATEGY_VERSION", "1"))
+
 # Strategy symbol assignments
 MEAN_REVERSION_SYMBOLS = ["SPY", "QQQ"]
 MOMENTUM_BREAKOUT_SYMBOLS = ["BTC/USD"]
@@ -24,6 +29,14 @@ CRYPTO_SYMBOLS = ["BTC/USD"]
 MEAN_REVERSION_TIMEFRAME = "15Min"
 MEAN_REVERSION_PERIOD = 20
 STD_DEV_THRESHOLDS = {"SPY": 1.5, "QQQ": 1.8}
+
+# Strategy 2.0 — Pooled-capital dynamic mean reversion across 4 symbols
+# Thresholds and risk % derived from grid-search backtest (2020-2026, 5.9 years).
+# Dynamic cap: each symbol is allocated equity/4 of the live account, compounding.
+# Risk per trade: 0.25% of total portfolio equity risked on a 1-ATR adverse move.
+MR_V2_SYMBOLS    = ["SPY", "QQQ", "GLD", "USO"]
+MR_V2_THRESHOLDS = {"SPY": 0.25, "QQQ": 0.30, "GLD": 0.25, "USO": 0.25}
+MR_V2_RISK_PCT   = 0.0025   # 0.25% of total portfolio equity per trade
 
 # Momentum Breakout — 1-hour candles, 20-period channel
 MOMENTUM_TIMEFRAME = "1Hour"
