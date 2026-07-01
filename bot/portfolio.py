@@ -341,26 +341,42 @@ class Portfolio:
         self._replace_stop_order(symbol, candidate, direction)
         self._save_state()
 
+    # Orders in these statuses are done and cannot be cancelled. Everything
+    # else — including "held", the status Alpaca gives an OTO/bracket
+    # stop_loss leg while it waits for its parent to fill — is still live.
+    _TERMINAL_ORDER_STATUSES = frozenset({
+        "filled", "canceled", "expired", "rejected", "replaced", "done_for_day",
+    })
+
     def cancel_open_stop_orders(self, symbol: str, side: str) -> int:
-        """Cancel all open stop/stop_limit orders for *symbol* on *side*.
+        """Cancel all live stop/stop_limit orders for *symbol* on *side*.
 
         Returns the number of orders cancelled. Called before placing any new
         protective stop to prevent Alpaca error 40310000 (wash-trade detection)
         from a lingering opposite-side order that was not cleaned up — for
         example when a prior cancel_order call failed silently, or the bot
         crashed between cancellation and position close.
+
+        Queries status="all" rather than "open": a stop_loss leg of an
+        OTO/bracket order sits in status "held" while waiting on its parent
+        to fill, and Alpaca's "open" filter does not include "held" orders —
+        so a sweep scoped to "open" would silently miss it.
         """
         try:
-            open_orders = self.api.list_orders(status="open", symbols=[symbol])
+            candidate_orders = self.api.list_orders(status="all", symbols=[symbol])
         except Exception as exc:
             logger.error(
-                "%s: Cannot list open orders for pre-placement sweep (side=%s): %s",
+                "%s: Cannot list orders for pre-placement sweep (side=%s): %s",
                 symbol, side, exc,
             )
             return 0
 
         cancelled = 0
-        for order in open_orders:
+        for order in candidate_orders:
+            raw_status = getattr(order, "status", "")
+            status = (raw_status.value if hasattr(raw_status, "value") else str(raw_status)).lower()
+            if status in self._TERMINAL_ORDER_STATUSES:
+                continue
             raw_type = getattr(order, "type", "")
             raw_side = getattr(order, "side", "")
             order_type = (raw_type.value if hasattr(raw_type, "value") else str(raw_type)).lower()

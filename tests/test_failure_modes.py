@@ -36,13 +36,39 @@ def _make_order(
     filled_qty: str | None = "136",
     limit_price=None,
     id: str = "order-1",
+    status: str = "filled",
+    legs=None,
 ):
     order = MagicMock()
     order.filled_avg_price = filled_avg_price
     order.filled_qty = filled_qty
     order.limit_price = limit_price
     order.id = id
+    order.status = status  # plain string so _wait_for_fill doesn't poll for 10s
+    order.legs = legs
     return order
+
+
+def _make_oto_order(
+    filled_avg_price: str | None = "520.00",
+    filled_qty: str | None = "136",
+    id: str = "mkt-1",
+    stop_leg_id: str = "stop-1",
+    stop_side: str = "sell",
+    status: str = "filled",
+):
+    """A single OTO order response: market entry + a populated stop_loss leg.
+
+    _enter() now submits one order_class="oto" order rather than a separate
+    market order followed by a separate stop order."""
+    leg = MagicMock()
+    leg.id = stop_leg_id
+    leg.side = stop_side
+    leg.type = "stop"
+    return _make_order(
+        filled_avg_price=filled_avg_price, filled_qty=filled_qty, id=id,
+        status=status, legs=[leg],
+    )
 
 
 def _make_df_bars(n: int = 25) -> pd.DataFrame:
@@ -129,24 +155,29 @@ class TestPositionFetchError:
 
 
 # ---------------------------------------------------------------------------
-# Fix 2 — Stop order failure triggers emergency close
+# Fix 2 — Missing protective stop triggers emergency close
+#
+# _enter() now submits a single order_class="oto" order (market entry +
+# stop_loss leg) instead of two separate orders, so the old "stop order
+# submission raises" scenario no longer exists as a code path. What still
+# must hold: if the broker response has no protective stop leg for any
+# reason, the position must not be left unprotected — close it immediately.
 # ---------------------------------------------------------------------------
 
 class TestStopOrderFailure:
-    def test_emergency_close_when_stop_order_rejected(self, strategy, api, portfolio):
-        api.submit_order.side_effect = [
-            _make_order(id="mkt-1"),        # market order succeeds
-            Exception("stop order rejected"),  # stop order fails
-        ]
+    def test_emergency_close_when_stop_leg_missing(self, strategy, api, portfolio):
+        """If the OTO order response has no stop_loss leg, close immediately."""
+        api.submit_order.return_value = _make_order(id="mkt-1", legs=[])
+        api.get_order.return_value = _make_order(id="mkt-1", legs=[])
+
         strategy._enter("SPY", "buy", "long", 136, 518.0)
 
         api.close_position.assert_called_once_with("SPY")
 
-    def test_record_entry_not_called_after_stop_failure(self, strategy, api, portfolio):
-        api.submit_order.side_effect = [
-            _make_order(id="mkt-1"),
-            Exception("rejected"),
-        ]
+    def test_record_entry_not_called_when_stop_leg_missing(self, strategy, api, portfolio):
+        api.submit_order.return_value = _make_order(id="mkt-1", legs=[])
+        api.get_order.return_value = _make_order(id="mkt-1", legs=[])
+
         strategy._enter("SPY", "buy", "long", 136, 518.0)
 
         assert "SPY" not in portfolio.entry_prices
@@ -159,10 +190,9 @@ class TestStopOrderFailure:
         api.close_position.assert_not_called()
 
     def test_successful_entry_calls_record_entry(self, strategy, api, portfolio):
-        api.submit_order.side_effect = [
-            _make_order(id="mkt-1", filled_avg_price="520.00", filled_qty="136"),
-            _make_order(id="stop-1"),
-        ]
+        api.submit_order.return_value = _make_oto_order(
+            id="mkt-1", filled_avg_price="520.00", filled_qty="136", stop_leg_id="stop-1",
+        )
         strategy._enter("SPY", "buy", "long", 136, 518.0)
 
         assert portfolio.entry_prices.get("SPY") == 520.0
@@ -174,22 +204,16 @@ class TestStopOrderFailure:
 # ---------------------------------------------------------------------------
 
 class TestPartialFillHandling:
-    def test_stop_order_uses_filled_qty_not_requested(self, strategy, api, portfolio):
-        # Market order fills 120 out of 136 requested
-        api.submit_order.side_effect = [
-            _make_order(id="mkt-1", filled_avg_price="520.00", filled_qty="120"),
-            _make_order(id="stop-1"),
-        ]
-        strategy._enter("SPY", "buy", "long", 136, 518.0)
-
-        stop_call = api.submit_order.call_args_list[1]
-        assert stop_call.kwargs["qty"] == 120
-
+    # Note: there is no longer a client-submitted "stop order qty" to assert
+    # on — the stop_loss leg is part of the single OTO order, and Alpaca
+    # sizes it to the parent's actual filled quantity server-side. What we
+    # can and must still verify is that our own bookkeeping (entry_sizes,
+    # used for position sizing / locked-notional accounting) reflects the
+    # actual fill, not the originally requested size.
     def test_record_entry_uses_filled_qty(self, strategy, api, portfolio):
-        api.submit_order.side_effect = [
-            _make_order(id="mkt-1", filled_avg_price="520.00", filled_qty="120"),
-            _make_order(id="stop-1"),
-        ]
+        api.submit_order.return_value = _make_oto_order(
+            id="mkt-1", filled_avg_price="520.00", filled_qty="120", stop_leg_id="stop-1",
+        )
         strategy._enter("SPY", "buy", "long", 136, 518.0)
 
         assert portfolio.entry_sizes.get("SPY") == 120
@@ -217,12 +241,14 @@ class TestPartialFillHandling:
         assert isinstance(result, float)
         assert result == pytest.approx(0.123456)
 
-    def test_partial_fill_triggers_emergency_close_if_stop_fails(self, strategy, api, portfolio):
-        # Market order partially fills; stop order is then rejected (oversell)
-        api.submit_order.side_effect = [
-            _make_order(id="mkt-1", filled_qty="120"),
-            Exception("would create oversell"),
-        ]
+    def test_partial_fill_with_missing_stop_leg_triggers_emergency_close(
+        self, strategy, api, portfolio
+    ):
+        # Market leg partially fills, but the response carries no stop_loss leg
+        order = _make_order(id="mkt-1", filled_qty="120", legs=[])
+        api.submit_order.return_value = order
+        api.get_order.return_value = order
+
         strategy._enter("SPY", "buy", "long", 136, 518.0)
 
         api.close_position.assert_called_once_with("SPY")

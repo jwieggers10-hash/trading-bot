@@ -1,25 +1,34 @@
-"""Tests reproducing Alpaca error 40310000 (wash-trade) and verifying the fix.
+"""Tests covering Alpaca error 40310000 (wash-trade) and the OTO-order fix.
 
 Short-position stop tests are in TestShortPositionStop at the bottom of this file.
 
-The bug: _enter() submitted a market order and then immediately submitted a
-stop order on the opposite side.  If a previous trade's stop order was not
-properly cleaned up (silent exception in _close(), bot crash between cancel and
-position close), Alpaca rejected the new stop with:
+Original bug: _enter() submitted a market order and then immediately submitted
+a *separate* stop order on the opposite side. Alpaca's wash-trade check races
+against its own order-status propagation, so a second top-level order for the
+opposite side can be rejected even after polling the entry order to
+status="filled":
   "40310000: potential wash trade detected. opposite side market/stop order exists"
-The position was then left open with no stop-loss protection.
+This fired almost every time for short entries (SELL market + BUY stop) and
+intermittently for longs, leaving the position open with no protection.
 
-The fix: cancel_open_stop_orders(symbol, side) is called before every stop
-placement in _enter(), _close(), and _replace_stop_order().  It lists all open
-stop orders for the symbol on the given side and cancels any it finds, so there
-is never more than one stop order active at a time.
+The fix: _enter() now submits ONE order — a market entry with
+order_class="oto" and a stop_loss leg — via _submit_protected_entry() in
+bot.strategies.mean_reversion. Alpaca holds the stop_loss leg (status "held")
+until the parent fills, then activates it server-side. Only one top-level
+order ever exists for the symbol, so there is nothing for the wash-trade
+check to compare it against.
+
+Because the stop leg now lives in "held" status while pending, and Alpaca's
+"open" order filter excludes "held" orders, cancel_open_stop_orders() sweeps
+status="all" (filtering out terminal statuses itself) instead of "open".
 
 Test structure:
   TestCancelOpenStopOrders  — unit tests for the Portfolio method in isolation
-  TestEnterDedup            — _enter() calls the sweep before placing its stop
+  TestEnterDedup            — _enter() sweeps stale stops before submitting the OTO order
   TestCloseDedup            — _close() calls the sweep before close_position
   TestReplaceStopDedup      — _replace_stop_order() calls the sweep after the tracked cancel
   TestV2EnterDedup          — MeanReversionV2._enter() has the same protection
+  TestShortPositionStop     — long and short entries both get a single OTO order with the correct stop leg
 """
 from unittest.mock import MagicMock, call, patch
 
@@ -41,6 +50,7 @@ def _make_order(
     filled_avg_price: str | None = "520.00",
     filled_qty: str | None = "136",
     status: str = "filled",
+    legs=None,
 ):
     o = MagicMock()
     o.id = id
@@ -48,17 +58,36 @@ def _make_order(
     o.filled_qty = filled_qty
     o.limit_price = None
     o.status = status  # plain string so _wait_for_fill can compare without .value
+    o.legs = legs
     return o
 
 
-def _make_stop_order(id: str, side: str, order_type: str = "stop"):
+def _make_stop_order(id: str, side: str, order_type: str = "stop", status: str = "new"):
     """Return a mock Order object whose .type and .side are plain strings
     (matching the comparison path in cancel_open_stop_orders)."""
     o = MagicMock()
     o.id = id
     o.side = side
     o.type = order_type
+    o.status = status
     return o
+
+
+def _make_oto_order(
+    id: str = "mkt-1",
+    filled_avg_price: str | None = "520.00",
+    filled_qty: str | None = "136",
+    status: str = "filled",
+    stop_leg_id: str = "stop-leg-1",
+    stop_side: str = "sell",
+):
+    """A parent OTO order with a populated stop_loss leg, as Alpaca returns
+    it in the response to a single order_class="oto" submission."""
+    stop_leg = _make_stop_order(stop_leg_id, stop_side, order_type="stop", status="held")
+    return _make_order(
+        id=id, filled_avg_price=filled_avg_price, filled_qty=filled_qty,
+        status=status, legs=[stop_leg],
+    )
 
 
 def _make_df_bars(n: int = 25) -> pd.DataFrame:
@@ -228,76 +257,95 @@ class TestCancelOpenStopOrders:
         assert count == 1
         api.cancel_order.assert_called_once_with("enum-stop")
 
+    def test_queries_all_not_open(self, portfolio, api):
+        """Must query status="all": a bracket/OTO stop_loss leg sits in status
+        "held" while waiting on its parent, and Alpaca's "open" filter does
+        not include "held" orders — so scoping to "open" would miss it."""
+        api.list_orders.return_value = []
+
+        portfolio.cancel_open_stop_orders("SPY", "sell")
+
+        kwargs = api.list_orders.call_args.kwargs
+        assert kwargs.get("status") == "all"
+
+    def test_cancels_held_bracket_leg(self, portfolio, api):
+        """A stop_loss leg of an OTO/bracket order in status="held" must
+        still be found and cancelled by the sweep."""
+        held_leg = _make_stop_order("held-stop-1", side="sell", order_type="stop", status="held")
+        api.list_orders.return_value = [held_leg]
+
+        count = portfolio.cancel_open_stop_orders("SPY", "sell")
+
+        assert count == 1
+        api.cancel_order.assert_called_once_with("held-stop-1")
+
+    def test_skips_terminal_status_orders(self, portfolio, api):
+        """Orders already filled/canceled/expired/rejected must not be
+        re-cancelled — status="all" surfaces history, not just live orders."""
+        for status in ("filled", "canceled", "expired", "rejected", "replaced", "done_for_day"):
+            api.cancel_order.reset_mock()
+            terminal = _make_stop_order(f"done-{status}", side="sell", order_type="stop", status=status)
+            api.list_orders.return_value = [terminal]
+
+            count = portfolio.cancel_open_stop_orders("SPY", "sell")
+
+            assert count == 0, f"status={status} should not be cancelled"
+            api.cancel_order.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
-# TestEnterDedup — _enter() sweeps stops before placing the new one
+# TestEnterDedup — _enter() sweeps stops before submitting the OTO order
 # ---------------------------------------------------------------------------
 
 class TestEnterDedup:
     def test_enter_cancels_dangling_stop_before_placing_new(self, strategy, api, portfolio):
         """
-        Reproduces the wash-trade scenario.
+        Reproduces the stale-stop scenario.
 
         A stop-sell order "old-stop-1" was left open on Alpaca because a prior
-        _close() call swallowed the cancel exception.  Without the fix, _enter()
-        would try to place a new stop-sell and Alpaca would return 40310000.
-        With the fix, old-stop-1 is cancelled first and the new stop succeeds.
+        _close() call swallowed the cancel exception. Without the sweep, the
+        new OTO order's stop_loss leg would coexist with it. With the fix,
+        old-stop-1 is cancelled first and the new OTO entry succeeds.
         """
         dangling = _make_stop_order("old-stop-1", side="sell")
         api.list_orders.return_value = [dangling]
-        api.submit_order.side_effect = [
-            _make_order(id="mkt-1"),        # market buy
-            _make_order(id="new-stop-1"),   # new stop-sell
-        ]
+        api.submit_order.return_value = _make_oto_order(
+            id="mkt-1", stop_leg_id="new-stop-1", stop_side="sell",
+        )
 
         strategy._enter("SPY", "buy", "long", 136, 518.0)
 
-        # Dangling order must be cancelled before the new stop is submitted
+        # Dangling order must be cancelled before the new OTO order is submitted
         api.cancel_order.assert_called_with("old-stop-1")
-        # Entry is recorded with the new stop order
+        # Entry is recorded with the OTO order's stop leg
         assert portfolio.stop_order_ids.get("SPY") == "new-stop-1"
 
-    def test_cancel_happens_before_stop_submission(self, strategy, api, portfolio):
-        """The sweep must precede the stop submit_order call, not follow it."""
+    def test_cancel_happens_before_order_submission(self, strategy, api, portfolio):
+        """The sweep must precede the OTO submit_order call, not follow it."""
         dangling = _make_stop_order("old-stop-1", side="sell")
         api.list_orders.return_value = [dangling]
-        call_sequence = []
-        api.cancel_order.side_effect = lambda *a, **kw: call_sequence.append(("cancel", a[0]))
-        api.submit_order.side_effect = [
-            _make_order(id="mkt-1"),
-            (lambda *a, **kw: call_sequence.append(("stop_submit", None)) or _make_order(id="s1"))(*[], **{}),
-        ]
-        # Rebuild to capture submit_order properly
-        api.submit_order.side_effect = None
-        api.submit_order.return_value = _make_order(id="mkt-1")
-
-        order_calls = []
-
-        def record_submit(**kwargs):
-            order_calls.append(kwargs.get("type", "?"))
-            if len(order_calls) == 1:
-                return _make_order(id="mkt-1")
-            return _make_order(id="new-stop-1")
-
-        api.submit_order.side_effect = lambda **kwargs: record_submit(**kwargs)
+        api.submit_order.return_value = _make_oto_order(id="mkt-1", stop_leg_id="s1")
 
         cancel_calls = []
         api.cancel_order.side_effect = lambda oid: cancel_calls.append(oid)
 
+        submit_calls = []
+        original_return = api.submit_order.return_value
+        api.submit_order.side_effect = lambda **kwargs: submit_calls.append(kwargs) or original_return
+
         strategy._enter("SPY", "buy", "long", 136, 518.0)
 
-        # cancel must have happened before the second submit_order (the stop)
         assert "old-stop-1" in cancel_calls
-        assert len(order_calls) == 2
-        assert order_calls[1] == "stop"
+        assert len(submit_calls) == 1
+        # cancel_calls populated strictly before the single submit_order call happened
+        assert cancel_calls == ["old-stop-1"]
 
     def test_enter_succeeds_when_no_dangling_orders(self, strategy, api, portfolio):
         """Normal path: no dangling orders, entry proceeds cleanly."""
         api.list_orders.return_value = []
-        api.submit_order.side_effect = [
-            _make_order(id="mkt-1", filled_avg_price="520.00", filled_qty="136"),
-            _make_order(id="stop-1"),
-        ]
+        api.submit_order.return_value = _make_oto_order(
+            id="mkt-1", filled_avg_price="520.00", filled_qty="136", stop_leg_id="stop-1",
+        )
 
         strategy._enter("SPY", "buy", "long", 136, 518.0)
 
@@ -308,10 +356,7 @@ class TestEnterDedup:
         """A long entry should only cancel sell stops, not buy stops."""
         buy_stop = _make_stop_order("buy-stop-1", side="buy")
         api.list_orders.return_value = [buy_stop]
-        api.submit_order.side_effect = [
-            _make_order(id="mkt-1"),
-            _make_order(id="stop-1"),
-        ]
+        api.submit_order.return_value = _make_oto_order(id="mkt-1", stop_leg_id="stop-1")
 
         strategy._enter("SPY", "buy", "long", 136, 518.0)
 
@@ -322,10 +367,9 @@ class TestEnterDedup:
         """A short entry should only cancel buy stops."""
         dangling = _make_stop_order("old-buy-stop", side="buy")
         api.list_orders.return_value = [dangling]
-        api.submit_order.side_effect = [
-            _make_order(id="mkt-short"),
-            _make_order(id="stop-buy-1"),
-        ]
+        api.submit_order.return_value = _make_oto_order(
+            id="mkt-short", stop_leg_id="stop-buy-1", stop_side="buy",
+        )
 
         strategy._enter("SPY", "sell", "short", 136, 522.0)
 
@@ -335,22 +379,18 @@ class TestEnterDedup:
     def test_entry_still_recorded_after_sweep_finds_nothing(self, strategy, api, portfolio):
         """list_orders returns empty — entry proceeds and is recorded."""
         api.list_orders.return_value = []
-        api.submit_order.side_effect = [
-            _make_order(id="mkt-1", filled_avg_price="520.00", filled_qty="136"),
-            _make_order(id="stop-1"),
-        ]
+        api.submit_order.return_value = _make_oto_order(
+            id="mkt-1", filled_avg_price="520.00", filled_qty="136", stop_leg_id="stop-1",
+        )
 
         strategy._enter("SPY", "buy", "long", 136, 518.0)
 
         assert portfolio.entry_prices.get("SPY") == 520.0
 
     def test_list_orders_failure_does_not_abort_entry(self, strategy, api, portfolio):
-        """If list_orders fails, we still attempt the stop rather than silently failing."""
+        """If list_orders fails, we still attempt the OTO entry rather than silently failing."""
         api.list_orders.side_effect = Exception("API error")
-        api.submit_order.side_effect = [
-            _make_order(id="mkt-1"),
-            _make_order(id="stop-1"),
-        ]
+        api.submit_order.return_value = _make_oto_order(id="mkt-1", stop_leg_id="stop-1")
 
         strategy._enter("SPY", "buy", "long", 136, 518.0)
 
@@ -481,13 +521,10 @@ class TestReplaceStopDedup:
 
 class TestV2EnterDedup:
     def test_v2_enter_cancels_dangling_stop(self, strategy_v2, api, portfolio):
-        """MeanReversionV2._enter() must also sweep before placing its stop."""
+        """MeanReversionV2._enter() must also sweep before submitting its OTO order."""
         dangling = _make_stop_order("old-stop-v2", side="sell")
         api.list_orders.return_value = [dangling]
-        api.submit_order.side_effect = [
-            _make_order(id="mkt-v2"),
-            _make_order(id="stop-v2"),
-        ]
+        api.submit_order.return_value = _make_oto_order(id="mkt-v2", stop_leg_id="stop-v2")
 
         strategy_v2._enter("SPY", "buy", "long", 136, 518.0)
 
@@ -496,10 +533,9 @@ class TestV2EnterDedup:
 
     def test_v2_enter_normal_path_unaffected(self, strategy_v2, api, portfolio):
         api.list_orders.return_value = []
-        api.submit_order.side_effect = [
-            _make_order(id="mkt-v2", filled_avg_price="520.00", filled_qty="136"),
-            _make_order(id="stop-v2"),
-        ]
+        api.submit_order.return_value = _make_oto_order(
+            id="mkt-v2", filled_avg_price="520.00", filled_qty="136", stop_leg_id="stop-v2",
+        )
 
         strategy_v2._enter("SPY", "buy", "long", 136, 518.0)
 
@@ -508,61 +544,64 @@ class TestV2EnterDedup:
 
 
 # ---------------------------------------------------------------------------
-# TestShortPositionStop — short entries get BUY stops without 40310000
+# TestShortPositionStop — long and short entries both get a protective stop
+# via a single OTO order, with no wash-trade rejection possible.
 #
 # Root cause of the original failure:
-#   For short entries (market SELL + BUY STOP), Alpaca's wash-trade detection
-#   fires when the market SELL order is still in "new"/"accepted" state when
-#   the BUY STOP is submitted.  The existing cancel_open_stop_orders sweep
-#   only removes stop-type orders — it does not cancel the entry market order
-#   itself, and cannot.  The fix is _wait_for_fill(), which polls the entry
-#   order until it transitions to "filled" before placing the protective stop.
+#   _enter() submitted the market entry and the protective stop as two
+#   separate top-level orders. Alpaca's wash-trade check (40310000) races
+#   against its own order-status propagation: even after polling the entry
+#   order to status="filled" via _wait_for_fill, a second standalone order on
+#   the opposite side could still be rejected. This fired almost every time
+#   for short entries (SELL market + BUY stop) and intermittently for longs.
 #
-#   Long entries (market BUY + SELL STOP) are unaffected because Alpaca
-#   recognises a SELL STOP on a long as a protective order, not a wash trade.
+#   The fix: submit ONE order with order_class="oto" and a stop_loss leg.
+#   Alpaca creates the stop leg immediately in "held" status and activates it
+#   server-side only once the market leg fills — no second top-level order is
+#   ever submitted, so the wash-trade check has nothing to compare against.
 # ---------------------------------------------------------------------------
 
 class TestShortPositionStop:
     def test_short_spy_gets_buy_stop(self, strategy, api, portfolio):
-        """Short SPY: market sell is followed by a buy stop on the correct side."""
+        """Short SPY: a single OTO order carries a buy stop_loss leg."""
         api.list_orders.return_value = []
-        api.submit_order.side_effect = [
-            _make_order(id="mkt-sell-spy", filled_avg_price="520.00", filled_qty="136"),
-            _make_order(id="buy-stop-spy"),
-        ]
+        api.submit_order.return_value = _make_oto_order(
+            id="mkt-sell-spy", filled_avg_price="520.00", filled_qty="136",
+            stop_leg_id="buy-stop-spy", stop_side="buy",
+        )
 
         strategy._enter("SPY", "sell", "short", 136, 522.0)
 
-        stop_kwargs = api.submit_order.call_args_list[1].kwargs
-        assert stop_kwargs["side"] == "buy"
+        entry_kwargs = api.submit_order.call_args_list[0].kwargs
+        assert entry_kwargs["order_class"] == "oto"
+        assert entry_kwargs["side"] == "sell"
+        assert float(entry_kwargs["stop_loss"]["stop_price"]) > 520.0
         assert portfolio.stop_order_ids.get("SPY") == "buy-stop-spy"
 
     def test_short_qqq_gets_buy_stop(self, strategy, api, portfolio):
-        """Short QQQ: market sell is followed by a buy stop."""
+        """Short QQQ: OTO order's stop leg is on the buy side."""
         api.list_orders.return_value = []
-        api.submit_order.side_effect = [
-            _make_order(id="mkt-sell-qqq", filled_avg_price="430.00", filled_qty="100"),
-            _make_order(id="buy-stop-qqq"),
-        ]
+        api.submit_order.return_value = _make_oto_order(
+            id="mkt-sell-qqq", filled_avg_price="430.00", filled_qty="100",
+            stop_leg_id="buy-stop-qqq", stop_side="buy",
+        )
 
         strategy._enter("QQQ", "sell", "short", 100, 433.0)
 
-        stop_kwargs = api.submit_order.call_args_list[1].kwargs
-        assert stop_kwargs["side"] == "buy"
         assert portfolio.stop_order_ids.get("QQQ") == "buy-stop-qqq"
 
     def test_long_gld_gets_sell_stop(self, strategy, api, portfolio):
-        """Long GLD: market buy is followed by a sell stop."""
+        """Long GLD: OTO order's stop leg is on the sell side."""
         api.list_orders.return_value = []
-        api.submit_order.side_effect = [
-            _make_order(id="mkt-buy-gld", filled_avg_price="180.00", filled_qty="55"),
-            _make_order(id="sell-stop-gld"),
-        ]
+        api.submit_order.return_value = _make_oto_order(
+            id="mkt-buy-gld", filled_avg_price="180.00", filled_qty="55",
+            stop_leg_id="sell-stop-gld", stop_side="sell",
+        )
 
         strategy._enter("GLD", "buy", "long", 55, 178.0)
 
-        stop_kwargs = api.submit_order.call_args_list[1].kwargs
-        assert stop_kwargs["side"] == "sell"
+        entry_kwargs = api.submit_order.call_args_list[0].kwargs
+        assert entry_kwargs["side"] == "buy"
         assert portfolio.stop_order_ids.get("GLD") == "sell-stop-gld"
 
     def test_short_entry_stop_price_above_entry(self, strategy, api, portfolio):
@@ -570,41 +609,44 @@ class TestShortPositionStop:
         entry_price = 520.0
         stop_price  = 523.0   # above entry → correct for short
         api.list_orders.return_value = []
-        api.submit_order.side_effect = [
-            _make_order(id="mkt-sell", filled_avg_price=str(entry_price), filled_qty="136"),
-            _make_order(id="buy-stop"),
-        ]
+        api.submit_order.return_value = _make_oto_order(
+            id="mkt-sell", filled_avg_price=str(entry_price), filled_qty="136",
+            stop_leg_id="buy-stop", stop_side="buy",
+        )
 
         strategy._enter("SPY", "sell", "short", 136, stop_price)
 
-        stop_kwargs = api.submit_order.call_args_list[1].kwargs
-        assert float(stop_kwargs["stop_price"]) > entry_price
+        entry_kwargs = api.submit_order.call_args_list[0].kwargs
+        assert float(entry_kwargs["stop_loss"]["stop_price"]) > entry_price
 
     def test_long_entry_stop_price_below_entry(self, strategy, api, portfolio):
         """Stop price for a long must be below the entry price."""
         entry_price = 520.0
         stop_price  = 517.0   # below entry → correct for long
         api.list_orders.return_value = []
-        api.submit_order.side_effect = [
-            _make_order(id="mkt-buy", filled_avg_price=str(entry_price), filled_qty="136"),
-            _make_order(id="sell-stop"),
-        ]
+        api.submit_order.return_value = _make_oto_order(
+            id="mkt-buy", filled_avg_price=str(entry_price), filled_qty="136",
+            stop_leg_id="sell-stop", stop_side="sell",
+        )
 
         strategy._enter("SPY", "buy", "long", 136, stop_price)
 
-        stop_kwargs = api.submit_order.call_args_list[1].kwargs
-        assert float(stop_kwargs["stop_price"]) < entry_price
+        entry_kwargs = api.submit_order.call_args_list[0].kwargs
+        assert float(entry_kwargs["stop_loss"]["stop_price"]) < entry_price
 
     @patch("time.sleep")
-    def test_short_polls_until_filled_before_stop(self, mock_sleep, strategy, api, portfolio):
-        """_wait_for_fill polls get_order when status is not yet 'filled'."""
-        accepted = _make_order(id="mkt-sell", filled_avg_price=None, filled_qty=None,
-                               status="accepted")
-        filled   = _make_order(id="mkt-sell", filled_avg_price="520.00", filled_qty="136",
-                               status="filled")
-        stop_order = _make_order(id="buy-stop")
+    def test_short_polls_until_filled(self, mock_sleep, strategy, api, portfolio):
+        """_wait_for_fill polls get_order when the OTO entry isn't yet 'filled'."""
+        accepted = _make_oto_order(
+            id="mkt-sell", filled_avg_price=None, filled_qty=None,
+            status="accepted", stop_leg_id="buy-stop", stop_side="buy",
+        )
+        filled = _make_oto_order(
+            id="mkt-sell", filled_avg_price="520.00", filled_qty="136",
+            status="filled", stop_leg_id="buy-stop", stop_side="buy",
+        )
 
-        api.submit_order.side_effect = [accepted, stop_order]
+        api.submit_order.return_value = accepted
         api.get_order.return_value = filled
         api.list_orders.return_value = []
 
@@ -614,58 +656,88 @@ class TestShortPositionStop:
         mock_sleep.assert_called()
         assert portfolio.stop_order_ids.get("SPY") == "buy-stop"
 
-    def test_long_does_not_poll_for_fill(self, strategy, api, portfolio):
-        """Long entries skip _wait_for_fill entirely — no get_order calls."""
+    def test_long_also_polls_until_filled(self, strategy, api, portfolio):
+        """Long entries wait for fill too, for accurate fill price/qty (not a
+        wash-trade workaround — there's only ever one order now)."""
+        accepted = _make_oto_order(
+            id="mkt-buy", filled_avg_price=None, filled_qty=None,
+            status="accepted", stop_leg_id="sell-stop", stop_side="sell",
+        )
+        filled = _make_oto_order(
+            id="mkt-buy", filled_avg_price="520.00", filled_qty="136",
+            status="filled", stop_leg_id="sell-stop", stop_side="sell",
+        )
+        api.submit_order.return_value = accepted
+        api.get_order.return_value = filled
         api.list_orders.return_value = []
-        api.submit_order.side_effect = [
-            _make_order(id="mkt-buy", filled_avg_price="520.00", filled_qty="136"),
-            _make_order(id="sell-stop"),
-        ]
 
         strategy._enter("SPY", "buy", "long", 136, 518.0)
 
-        api.get_order.assert_not_called()
+        api.get_order.assert_called_with(accepted.id)
+        assert portfolio.entry_prices.get("SPY") == 520.0
 
-    def test_no_duplicate_stop_submitted_for_short(self, strategy, api, portfolio):
-        """Only one stop order is submitted per short entry (no duplicates)."""
+    def test_only_one_order_submitted_for_short(self, strategy, api, portfolio):
+        """Exactly one order is submitted per short entry — no separate stop
+        order, so there is nothing for Alpaca's wash-trade check to compare
+        against the entry (this is what makes 40310000 impossible here)."""
         api.list_orders.return_value = []
-        api.submit_order.side_effect = [
-            _make_order(id="mkt-sell"),
-            _make_order(id="buy-stop"),
-        ]
+        api.submit_order.return_value = _make_oto_order(
+            id="mkt-sell", stop_leg_id="buy-stop", stop_side="buy",
+        )
 
         strategy._enter("SPY", "sell", "short", 136, 522.0)
 
-        stop_submits = [
-            c for c in api.submit_order.call_args_list
-            if c.kwargs.get("type") == "stop"
-        ]
-        assert len(stop_submits) == 1
+        assert api.submit_order.call_count == 1
+        entry_kwargs = api.submit_order.call_args_list[0].kwargs
+        assert entry_kwargs["order_class"] == "oto"
+
+    def test_only_one_order_submitted_for_long(self, strategy, api, portfolio):
+        """Same guarantee for long entries."""
+        api.list_orders.return_value = []
+        api.submit_order.return_value = _make_oto_order(
+            id="mkt-buy", stop_leg_id="sell-stop", stop_side="sell",
+        )
+
+        strategy._enter("SPY", "buy", "long", 136, 518.0)
+
+        assert api.submit_order.call_count == 1
+
+    def test_missing_stop_leg_closes_position_immediately(self, strategy, api, portfolio):
+        """If Alpaca's response has no stop_loss leg, the position must not be
+        left unprotected — close it immediately rather than record the entry."""
+        api.list_orders.return_value = []
+        unprotected = _make_order(id="mkt-sell", filled_avg_price="520.00",
+                                   filled_qty="136", legs=[])
+        api.submit_order.return_value = unprotected
+        api.get_order.return_value = unprotected
+
+        strategy._enter("SPY", "sell", "short", 136, 522.0)
+
+        api.close_position.assert_called_once_with("SPY")
+        assert "SPY" not in portfolio.stop_order_ids
+        assert "SPY" not in portfolio.entry_prices
 
     def test_v2_short_spy_gets_buy_stop(self, strategy_v2, api, portfolio):
-        """MeanReversionV2: short SPY also gets a buy stop."""
+        """MeanReversionV2: short SPY also gets a buy stop via a single OTO order."""
         api.list_orders.return_value = []
-        api.submit_order.side_effect = [
-            _make_order(id="mkt-sell-v2", filled_avg_price="520.00", filled_qty="136"),
-            _make_order(id="buy-stop-v2"),
-        ]
+        api.submit_order.return_value = _make_oto_order(
+            id="mkt-sell-v2", filled_avg_price="520.00", filled_qty="136",
+            stop_leg_id="buy-stop-v2", stop_side="buy",
+        )
 
         strategy_v2._enter("SPY", "sell", "short", 136, 522.0)
 
-        stop_kwargs = api.submit_order.call_args_list[1].kwargs
-        assert stop_kwargs["side"] == "buy"
+        assert api.submit_order.call_count == 1
         assert portfolio.stop_order_ids.get("SPY") == "buy-stop-v2"
 
     def test_v2_short_qqq_gets_buy_stop(self, strategy_v2, api, portfolio):
         """MeanReversionV2: short QQQ also gets a buy stop."""
         api.list_orders.return_value = []
-        api.submit_order.side_effect = [
-            _make_order(id="mkt-sell-qqq-v2", filled_avg_price="430.00", filled_qty="100"),
-            _make_order(id="buy-stop-qqq-v2"),
-        ]
+        api.submit_order.return_value = _make_oto_order(
+            id="mkt-sell-qqq-v2", filled_avg_price="430.00", filled_qty="100",
+            stop_leg_id="buy-stop-qqq-v2", stop_side="buy",
+        )
 
         strategy_v2._enter("QQQ", "sell", "short", 100, 433.0)
 
-        stop_kwargs = api.submit_order.call_args_list[1].kwargs
-        assert stop_kwargs["side"] == "buy"
         assert portfolio.stop_order_ids.get("QQQ") == "buy-stop-qqq-v2"

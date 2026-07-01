@@ -36,12 +36,28 @@ def _make_order(
     filled_avg_price: str | None = "520.00",
     filled_qty: str | None = "136",
     limit_price=None,
+    status: str = "filled",
+    stop_side: str = "sell",
+    stop_leg_id: str | None = None,
 ):
+    """A single OTO order response: market entry + a populated stop_loss leg.
+
+    _enter() now submits one order_class="oto" order rather than a separate
+    market order followed by a separate stop order, so every test order needs
+    a `legs` entry for _find_child_stop_id() to locate — all entries in this
+    file are longs, so the stop leg defaults to the sell side.
+    """
     o = MagicMock()
     o.id = id
     o.filled_avg_price = filled_avg_price
     o.filled_qty = filled_qty
     o.limit_price = limit_price
+    o.status = status  # plain string so _wait_for_fill doesn't poll for 10s
+    leg = MagicMock()
+    leg.id = stop_leg_id or f"{id}-stop"
+    leg.side = stop_side
+    leg.type = "stop"
+    o.legs = [leg]
     return o
 
 
@@ -276,10 +292,9 @@ class TestSequentialCapitalDedup:
 
     def test_enter_updates_locked_notional_immediately(self, strategy, api, portfolio, rm):
         """After _enter("SPY"), get_locked_notional() must reflect the SPY entry."""
-        api.submit_order.side_effect = [
-            _make_order(id="mkt-spy", filled_avg_price="520.00", filled_qty="192"),
-            _make_order(id="stop-spy"),
-        ]
+        api.submit_order.return_value = _make_order(
+            id="mkt-spy", filled_avg_price="520.00", filled_qty="192", stop_leg_id="stop-spy",
+        )
 
         strategy._enter("SPY", "buy", "long", 192, 518.0, est_price=520.0)
 
@@ -292,10 +307,9 @@ class TestSequentialCapitalDedup:
         SPY notional already locked.
         """
         # Enter SPY first
-        api.submit_order.side_effect = [
-            _make_order(id="mkt-spy", filled_avg_price="520.00", filled_qty="192"),
-            _make_order(id="stop-spy"),
-        ]
+        api.submit_order.return_value = _make_order(
+            id="mkt-spy", filled_avg_price="520.00", filled_qty="192", stop_leg_id="stop-spy",
+        )
         strategy._enter("SPY", "buy", "long", 192, 518.0, est_price=520.0)
 
         # Now compute what QQQ's max_notional would be
@@ -320,12 +334,11 @@ class TestSequentialCapitalDedup:
             ("QQQ", "485.00", 206),
             ("GLD", "195.00", 512),
         ]
-        order_seq = []
-        for sym, price, qty in entry_configs:
-            order_seq += [
-                _make_order(id=f"mkt-{sym}", filled_avg_price=price, filled_qty=str(qty)),
-                _make_order(id=f"stop-{sym}"),
-            ]
+        order_seq = [
+            _make_order(id=f"mkt-{sym}", filled_avg_price=price, filled_qty=str(qty),
+                        stop_leg_id=f"stop-{sym}")
+            for sym, price, qty in entry_configs
+        ]
         api.submit_order.side_effect = order_seq
 
         for sym, price, qty in entry_configs:
@@ -372,10 +385,9 @@ class TestSequentialCapitalDedup:
 
         # Set up API mocks for run("QQQ")
         api.list_positions.return_value = []  # QQQ is flat; SPY tracked in-memory only
-        api.submit_order.side_effect = [
-            _make_order(id="mkt-qqq", filled_avg_price="485.00", filled_qty="200"),
-            _make_order(id="stop-qqq"),
-        ]
+        api.submit_order.return_value = _make_order(
+            id="mkt-qqq", filled_avg_price="485.00", filled_qty="200", stop_leg_id="stop-qqq",
+        )
 
         bars = _make_bars(n=25, base_price=485.0)
         with patch.object(strategy, "_get_bars", return_value=bars), \
@@ -453,11 +465,10 @@ class TestFillPriceFallback:
         Reproduces the bug: filled_avg_price=None and get_latest_trade fails.
         After the fix, record_entry must store entry_price = est_price, not 0.
         """
-        api.submit_order.side_effect = [
-            # Market order returns before fill settles; filled_avg_price is None
-            _make_order(id="mkt-1", filled_avg_price=None, filled_qty="192"),
-            _make_order(id="stop-1"),
-        ]
+        # Market order returns before fill settles; filled_avg_price is None
+        api.submit_order.return_value = _make_order(
+            id="mkt-1", filled_avg_price=None, filled_qty="192", stop_leg_id="stop-1",
+        )
         # get_latest_trade also fails (data API down)
         api.get_latest_trade.side_effect = Exception("data API unavailable")
 
@@ -474,10 +485,9 @@ class TestFillPriceFallback:
         Without the fix, the next symbol would see locked_notional=0 for SPY
         and be allowed to allocate a full per_sym_cap independently.
         """
-        api.submit_order.side_effect = [
-            _make_order(id="mkt-1", filled_avg_price=None, filled_qty="192"),
-            _make_order(id="stop-1"),
-        ]
+        api.submit_order.return_value = _make_order(
+            id="mkt-1", filled_avg_price=None, filled_qty="192", stop_leg_id="stop-1",
+        )
         api.get_latest_trade.side_effect = Exception("data API unavailable")
 
         strategy._enter("SPY", "buy", "long", 192, 518.0, est_price=520.0)
@@ -489,10 +499,9 @@ class TestFillPriceFallback:
         self, strategy, api, portfolio
     ):
         """When filled_avg_price is present and > 0, it must NOT be replaced by est_price."""
-        api.submit_order.side_effect = [
-            _make_order(id="mkt-1", filled_avg_price="521.50", filled_qty="192"),
-            _make_order(id="stop-1"),
-        ]
+        api.submit_order.return_value = _make_order(
+            id="mkt-1", filled_avg_price="521.50", filled_qty="192", stop_leg_id="stop-1",
+        )
 
         strategy._enter("SPY", "buy", "long", 192, 518.0, est_price=520.0)
 
@@ -507,10 +516,9 @@ class TestFillPriceFallback:
         est_price, QQQ must see the correct locked notional and size accordingly.
         """
         # SPY enters with fill price fallback
-        api.submit_order.side_effect = [
-            _make_order(id="mkt-spy", filled_avg_price=None, filled_qty="192"),
-            _make_order(id="stop-spy"),
-        ]
+        api.submit_order.return_value = _make_order(
+            id="mkt-spy", filled_avg_price=None, filled_qty="192", stop_leg_id="stop-spy",
+        )
         api.get_latest_trade.side_effect = Exception("unavailable")
 
         strategy._enter("SPY", "buy", "long", 192, 518.0, est_price=520.0)
@@ -561,10 +569,9 @@ class TestFillPriceFallback:
 
         strat_v1 = MeanReversionStrategy(api, rm_v1, portfolio)
 
-        api.submit_order.side_effect = [
-            _make_order(id="mkt-v1", filled_avg_price=None, filled_qty="192"),
-            _make_order(id="stop-v1"),
-        ]
+        api.submit_order.return_value = _make_order(
+            id="mkt-v1", filled_avg_price=None, filled_qty="192", stop_leg_id="stop-v1",
+        )
         api.get_latest_trade.side_effect = Exception("unavailable")
         api.list_orders.return_value = []
 

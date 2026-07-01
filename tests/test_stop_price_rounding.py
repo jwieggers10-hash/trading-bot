@@ -23,12 +23,36 @@ def _make_order(
     filled_qty="136",
     limit_price=None,
     id="order-1",
+    status="filled",
 ):
     o = MagicMock()
     o.filled_avg_price = filled_avg_price
     o.filled_qty = filled_qty
     o.limit_price = limit_price
     o.id = id
+    o.status = status  # plain string so _wait_for_fill doesn't poll for 10s
+    o.legs = None
+    return o
+
+
+def _make_oto_order(
+    filled_avg_price="520.00",
+    filled_qty="136",
+    id="mkt-1",
+    stop_leg_id="stop-1",
+    stop_side="sell",
+    status="filled",
+):
+    """A single OTO order response: market entry + a populated stop_loss leg.
+
+    _enter() now submits one order_class="oto" order carrying the stop_loss
+    price rather than a separate follow-up stop order."""
+    o = _make_order(filled_avg_price=filled_avg_price, filled_qty=filled_qty, id=id, status=status)
+    leg = MagicMock()
+    leg.id = stop_leg_id
+    leg.side = stop_side
+    leg.type = "stop"
+    o.legs = [leg]
     return o
 
 
@@ -124,54 +148,52 @@ class TestRoundStopPrice:
 # ---------------------------------------------------------------------------
 
 class TestEnterStopPriceSubmission:
+    """_enter() now submits a single order_class="oto" order whose stop_loss.stop_price
+    carries the rounded stop — there is no longer a separate follow-up stop submission."""
+
     def test_spy_long_entry_submits_2dp_stop(self, strategy, api):
-        api.submit_order.side_effect = [
-            _make_order(id="mkt-1", filled_avg_price="730.59", filled_qty="136"),
-            _make_order(id="stop-1"),
-        ]
+        api.submit_order.return_value = _make_oto_order(
+            filled_avg_price="730.59", filled_qty="136", stop_side="sell",
+        )
         strategy._enter("SPY", "buy", "long", 136, 730.5911)
 
-        stop_call = api.submit_order.call_args_list[1]
-        submitted = stop_call.kwargs["stop_price"]
+        entry_call = api.submit_order.call_args_list[0]
+        submitted = entry_call.kwargs["stop_loss"]["stop_price"]
         assert _decimal_places(submitted) <= 2, f"stop_price={submitted!r} has more than 2 dp"
 
     def test_spy_long_entry_floors_stop_price(self, strategy, api):
-        api.submit_order.side_effect = [
-            _make_order(id="mkt-1", filled_avg_price="730.59", filled_qty="136"),
-            _make_order(id="stop-1"),
-        ]
+        api.submit_order.return_value = _make_oto_order(
+            filled_avg_price="730.59", filled_qty="136", stop_side="sell",
+        )
         strategy._enter("SPY", "buy", "long", 136, 730.5911)
 
-        stop_call = api.submit_order.call_args_list[1]
-        assert stop_call.kwargs["stop_price"] == "730.59"
+        entry_call = api.submit_order.call_args_list[0]
+        assert entry_call.kwargs["stop_loss"]["stop_price"] == "730.59"
 
     def test_qqq_short_entry_submits_2dp_stop(self, strategy, api):
-        api.submit_order.side_effect = [
-            _make_order(id="mkt-1", filled_avg_price="460.20", filled_qty="136"),
-            _make_order(id="stop-1"),
-        ]
+        api.submit_order.return_value = _make_oto_order(
+            filled_avg_price="460.20", filled_qty="136", stop_side="buy",
+        )
         strategy._enter("QQQ", "sell", "short", 136, 461.1234)
 
-        stop_call = api.submit_order.call_args_list[1]
-        submitted = stop_call.kwargs["stop_price"]
+        entry_call = api.submit_order.call_args_list[0]
+        submitted = entry_call.kwargs["stop_loss"]["stop_price"]
         assert _decimal_places(submitted) <= 2, f"stop_price={submitted!r} has more than 2 dp"
 
     def test_qqq_short_entry_ceils_stop_price(self, strategy, api):
-        api.submit_order.side_effect = [
-            _make_order(id="mkt-1", filled_avg_price="460.20", filled_qty="136"),
-            _make_order(id="stop-1"),
-        ]
+        api.submit_order.return_value = _make_oto_order(
+            filled_avg_price="460.20", filled_qty="136", stop_side="buy",
+        )
         strategy._enter("QQQ", "sell", "short", 136, 461.1201)
 
-        stop_call = api.submit_order.call_args_list[1]
-        assert stop_call.kwargs["stop_price"] == "461.13"
+        entry_call = api.submit_order.call_args_list[0]
+        assert entry_call.kwargs["stop_loss"]["stop_price"] == "461.13"
 
     def test_record_entry_receives_rounded_stop(self, strategy, api, portfolio):
         """The in-memory trailing stop must match the broker order price."""
-        api.submit_order.side_effect = [
-            _make_order(id="mkt-1", filled_avg_price="730.59", filled_qty="136"),
-            _make_order(id="stop-1"),
-        ]
+        api.submit_order.return_value = _make_oto_order(
+            filled_avg_price="730.59", filled_qty="136", stop_side="sell",
+        )
         strategy._enter("SPY", "buy", "long", 136, 730.5911)
 
         stored = portfolio.trailing_stops.get("SPY")

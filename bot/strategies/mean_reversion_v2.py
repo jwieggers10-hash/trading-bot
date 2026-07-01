@@ -24,7 +24,6 @@ from datetime import datetime, timedelta, timezone
 import pandas as pd
 
 from bot.portfolio import PositionFetchError
-from bot.risk_manager import round_stop_price
 from bot.telegram_notifier import notifier
 from config import (
     MEAN_REVERSION_PERIOD,
@@ -204,81 +203,20 @@ class MeanReversionV2:
 
     def _enter(self, symbol: str, side: str, direction: str,
                size: int, stop: float, est_price: float = 0.0):
-        try:
-            order = self.api.submit_order(
-                symbol=symbol,
-                qty=size,
-                side=side,
-                type="market",
-                time_in_force="day",
-            )
-        except Exception as exc:
-            logger.error("%s: Market order failed (%s %d): %s", symbol, side, size, exc)
+        from bot.strategies.mean_reversion import _submit_protected_entry
+
+        result = _submit_protected_entry(
+            self.api, self.portfolio, symbol, side, direction, size, stop, est_price,
+        )
+        if result is None:
             return
-
-        notifier.trade_entry_submitted(symbol, side, size, est_price)
-
-        from bot.strategies.mean_reversion import _filled_qty, _fill_price, _wait_for_fill
-
-        # For short entries (market SELL + BUY STOP), Alpaca's wash-trade detection
-        # (error 40310000) fires when an open SELL order coexists with a new BUY order.
-        # Wait for the market fill before placing the protective stop. Long entries are
-        # unaffected — a SELL STOP on a long is a recognized protective pattern.
-        if direction == "short":
-            order = _wait_for_fill(order, self.api, symbol)
-
-        filled      = _filled_qty(order, size)
-        entry_price = _fill_price(order, self.api, symbol)
-        if entry_price <= 0:
-            # Alpaca paper-trading returns orders before they settle; filled_avg_price is
-            # sometimes None and get_latest_trade may also fail.  Fall back to the signal
-            # price so that record_entry() stores a non-zero cost basis, preventing
-            # get_locked_notional() from undercounting deployed capital for later symbols.
-            entry_price = est_price
-            logger.warning(
-                "%s: fill price unavailable from broker — using signal price %.4f "
-                "for locked-capital accounting",
-                symbol, est_price,
-            )
-
-        stop_side    = "sell" if direction == "long" else "buy"
-        rounded_stop = round_stop_price(stop, stop_side, symbol)
-
-        # Cancel any lingering stop orders before placing the new one.
-        # Prevents Alpaca error 40310000 (wash-trade) from a prior position's
-        # stop that was not cleaned up due to a silent cancel failure or bot crash.
-        self.portfolio.cancel_open_stop_orders(symbol, stop_side)
-
-        try:
-            stop_order = self.api.submit_order(
-                symbol=symbol,
-                qty=filled,
-                side=stop_side,
-                type="stop",
-                time_in_force="gtc",
-                stop_price=str(rounded_stop),
-            )
-        except Exception as exc:
-            logger.critical(
-                "%s: STOP ORDER FAILED after market fill — closing immediately. "
-                "order=%s filled=%d error=%s",
-                symbol, order.id, filled, exc,
-            )
-            notifier.critical_error(
-                f"{symbol}: Stop order failed after market fill",
-                f"order={order.id} filled={filled} error={exc}",
-            )
-            try:
-                self.api.close_position(symbol)
-            except Exception as close_exc:
-                logger.critical("%s: Emergency close also failed: %s", symbol, close_exc)
-            return
+        filled, entry_price, rounded_stop, stop_order_id = result
 
         self.portfolio.record_entry(
-            symbol, direction, entry_price, filled, stop_order.id, rounded_stop
+            symbol, direction, entry_price, filled, stop_order_id, rounded_stop
         )
         notifier.trade_entry_filled(symbol, direction, filled, entry_price, stop)
-        notifier.stop_order_submitted(symbol, stop_side, filled, stop)
+        notifier.stop_order_submitted(symbol, "sell" if direction == "long" else "buy", filled, stop)
         logger.info(
             "%s [v2]: Entered %s x%d at %.4f, stop %.4f  "
             "(risk $%.0f on $%.0f equity)",

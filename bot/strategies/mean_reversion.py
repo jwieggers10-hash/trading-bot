@@ -163,80 +163,16 @@ class MeanReversionStrategy:
         self, symbol: str, side: str, direction: str, size: int, stop: float,
         est_price: float = 0.0,
     ):
-        # Step 1: submit market order
-        try:
-            order = self.api.submit_order(
-                symbol=symbol,
-                qty=size,
-                side=side,
-                type="market",
-                time_in_force="day",
-            )
-        except Exception as exc:
-            logger.error("%s: Market order failed (%s %d): %s", symbol, side, size, exc)
+        result = _submit_protected_entry(
+            self.api, self.portfolio, symbol, side, direction, size, stop, est_price,
+        )
+        if result is None:
             return
+        filled, entry_price, rounded_stop, stop_order_id = result
 
-        notifier.trade_entry_submitted(symbol, side, size, est_price)
-
-        # For short entries (market SELL + BUY STOP), Alpaca's wash-trade detection
-        # (error 40310000) fires when an open SELL order coexists with a new BUY order.
-        # Wait for the market fill before placing the protective stop. Long entries are
-        # unaffected — a SELL STOP on a long is a recognized protective pattern.
-        if direction == "short":
-            order = _wait_for_fill(order, self.api, symbol)
-
-        filled = _filled_qty(order, size)
-        entry_price = _fill_price(order, self.api, symbol)
-        if entry_price <= 0:
-            # Alpaca paper-trading returns orders before they settle; filled_avg_price is
-            # sometimes None and get_latest_trade may also fail.  Fall back to the signal
-            # price so that record_entry() stores a non-zero cost basis, preventing
-            # get_locked_notional() from undercounting deployed capital for later symbols.
-            entry_price = est_price
-            logger.warning(
-                "%s: fill price unavailable from broker — using signal price %.4f "
-                "for locked-capital accounting",
-                symbol, est_price,
-            )
-
-        # Step 2: place broker-side stop for the actual filled quantity.
-        # If this fails, the position is open with no protection — close it immediately.
-        stop_side = "sell" if direction == "long" else "buy"
-        rounded_stop = round_stop_price(stop, stop_side, symbol)
-
-        # Cancel any lingering stop orders before placing the new one.
-        # Prevents Alpaca error 40310000 (wash-trade) from a prior position's
-        # stop that was not cleaned up due to a silent cancel failure or bot crash.
-        self.portfolio.cancel_open_stop_orders(symbol, stop_side)
-
-        try:
-            stop_order = self.api.submit_order(
-                symbol=symbol,
-                qty=filled,
-                side=stop_side,
-                type="stop",
-                time_in_force="gtc",
-                stop_price=str(rounded_stop),
-            )
-        except Exception as exc:
-            logger.critical(
-                "%s: STOP ORDER FAILED after market fill — closing position immediately. "
-                "market_order=%s filled=%d error=%s",
-                symbol, order.id, filled, exc,
-            )
-            notifier.critical_error(
-                f"{symbol}: Stop order failed after market fill",
-                f"order={order.id} filled={filled} error={exc}",
-            )
-            try:
-                self.api.close_position(symbol)
-            except Exception as close_exc:
-                logger.critical("%s: Emergency close also failed: %s", symbol, close_exc)
-            return
-
-        self.portfolio.record_entry(symbol, direction, entry_price, filled, stop_order.id, rounded_stop)
+        self.portfolio.record_entry(symbol, direction, entry_price, filled, stop_order_id, rounded_stop)
         notifier.trade_entry_filled(symbol, direction, filled, entry_price, stop)
-        notifier.stop_order_submitted(symbol, stop_side, filled, stop)
+        notifier.stop_order_submitted(symbol, "sell" if direction == "long" else "buy", filled, stop)
         logger.info(
             "%s: Entered %s x%d at %.4f (requested %d), stop at %.4f",
             symbol, direction, filled, entry_price, size, stop,
@@ -288,9 +224,8 @@ def _wait_for_fill(
 ) -> object:
     """Poll until *order* is filled (or terminal) or *timeout* seconds pass.
 
-    Returns the most recently fetched order object. Used before placing a BUY
-    STOP for a short entry to close the race window that triggers Alpaca error
-    40310000 (wash-trade: open SELL market order + new BUY order).
+    Returns the most recently fetched order object, so callers get an
+    accurate filled_qty / filled_avg_price for record-keeping.
     """
     _TERMINAL = frozenset({"filled", "canceled", "expired", "rejected", "done_for_day"})
     deadline = time.monotonic() + timeout
@@ -335,3 +270,119 @@ def _filled_qty(order, requested):
     except (TypeError, ValueError):
         pass
     return requested
+
+
+def _find_child_stop_id(order, api, symbol: str, stop_side: str) -> str | None:
+    """Return the order id of the stop_loss child leg of an OTO/bracket order.
+
+    Alpaca populates the held child leg(s) under `order.legs` in the response
+    to the initial order submission. Falls back to a nested re-fetch in case
+    a given broker response omitted legs (defensive; not expected in normal
+    operation).
+    """
+    def _search(o):
+        for leg in (getattr(o, "legs", None) or []):
+            raw_type = getattr(leg, "type", None)
+            leg_type = (raw_type.value if hasattr(raw_type, "value") else str(raw_type)).lower()
+            raw_side = getattr(leg, "side", None)
+            leg_side = (raw_side.value if hasattr(raw_side, "value") else str(raw_side)).lower()
+            if leg_type in ("stop", "stop_limit") and leg_side == stop_side:
+                return leg.id
+        return None
+
+    stop_id = _search(order)
+    if stop_id:
+        return stop_id
+
+    try:
+        refetched = api.get_order(order.id, nested=True)
+    except Exception as exc:
+        logger.warning("%s: Could not re-fetch order %s to find stop leg: %s", symbol, order.id, exc)
+        return None
+    return _search(refetched)
+
+
+def _submit_protected_entry(
+    api, portfolio, symbol: str, side: str, direction: str, size, stop: float,
+    est_price: float = 0.0,
+):
+    """Submit a market entry with its protective stop as a single OTO order.
+
+    Root cause of the previous failure: submitting the market entry and the
+    protective stop as two separate top-level orders races Alpaca's wash-trade
+    check (error 40310000, "opposite side market/stop order exists"). Waiting
+    for the entry to report status="filled" narrows but does not close this
+    race — Alpaca's wash-trade check does not appear to be synchronized with
+    the order-status value the /orders endpoint reports, so a second
+    standalone order submitted right after can still be evaluated against the
+    entry while it looks "open" on Alpaca's side. This showed up almost every
+    time for short entries (SELL market + BUY stop) and intermittently for
+    longs (BUY market + SELL stop) — consistent with a timing race rather
+    than a rule that categorically forbids standalone stops on one side.
+
+    order_class="oto" avoids the race structurally: Alpaca accepts a single
+    order whose stop_loss leg is created immediately in "held" status and
+    activated server-side only once the parent market leg fills. Only one
+    top-level order is ever submitted, so there is never a second order for
+    Alpaca's wash-trade check to compare against the entry.
+
+    Returns (filled_qty, entry_price, rounded_stop_price, stop_order_id), or
+    None if the entry could not be safely protected — in which case the
+    position has already been closed out here.
+    """
+    stop_side = "sell" if direction == "long" else "buy"
+    rounded_stop = round_stop_price(stop, stop_side, symbol)
+
+    # Sweep any lingering same-side stop orders (including held OTO/bracket
+    # legs) so a stale one can never coexist with the new submission.
+    portfolio.cancel_open_stop_orders(symbol, stop_side)
+
+    try:
+        order = api.submit_order(
+            symbol=symbol,
+            qty=size,
+            side=side,
+            type="market",
+            time_in_force="gtc",
+            order_class="oto",
+            stop_loss={"stop_price": str(rounded_stop)},
+        )
+    except Exception as exc:
+        logger.error("%s: OTO entry order failed (%s %s): %s", symbol, side, size, exc)
+        return None
+
+    notifier.trade_entry_submitted(symbol, side, size, est_price)
+
+    order = _wait_for_fill(order, api, symbol)
+    filled = _filled_qty(order, size)
+    entry_price = _fill_price(order, api, symbol)
+    if entry_price <= 0:
+        # Alpaca paper-trading returns orders before they settle; filled_avg_price is
+        # sometimes None and get_latest_trade may also fail.  Fall back to the signal
+        # price so that record_entry() stores a non-zero cost basis, preventing
+        # get_locked_notional() from undercounting deployed capital for later symbols.
+        entry_price = est_price
+        logger.warning(
+            "%s: fill price unavailable from broker — using signal price %.4f "
+            "for locked-capital accounting",
+            symbol, est_price,
+        )
+
+    stop_order_id = _find_child_stop_id(order, api, symbol, stop_side)
+    if not stop_order_id:
+        logger.critical(
+            "%s: Protective stop leg missing after OTO entry — closing position immediately. "
+            "order=%s filled=%s",
+            symbol, order.id, filled,
+        )
+        notifier.critical_error(
+            f"{symbol}: Protective stop leg missing after OTO entry",
+            f"order={order.id} filled={filled}",
+        )
+        try:
+            api.close_position(symbol)
+        except Exception as close_exc:
+            logger.critical("%s: Emergency close also failed: %s", symbol, close_exc)
+        return None
+
+    return filled, entry_price, rounded_stop, stop_order_id
