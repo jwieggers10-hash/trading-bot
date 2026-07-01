@@ -139,20 +139,36 @@ class MeanReversionStrategy:
                                symbol, atr, equity)
                 return
 
+            candle_ts = bars.index[-1]
+
             if price < sig["lower"]:
+                if self.portfolio.entry_signal_already_processed(symbol, candle_ts, "long"):
+                    logger.info(
+                        "%s: Long signal for candle %s already attempted — skipping to "
+                        "avoid a duplicate order after restart", symbol, candle_ts,
+                    )
+                    return
                 logger.info(
                     "%s: Long signal — %.4f < lower band %.4f (SMA %.4f, ATR %.4f, size %d)",
                     symbol, price, sig["lower"], sma, atr, size,
                 )
                 stop = self.rm.stop_price("long", price, atr)
+                self.portfolio.record_entry_signal(symbol, candle_ts, "long")
                 self._enter(symbol, "buy", "long", size, stop, est_price=price)
 
             elif price > sig["upper"]:
+                if self.portfolio.entry_signal_already_processed(symbol, candle_ts, "short"):
+                    logger.info(
+                        "%s: Short signal for candle %s already attempted — skipping to "
+                        "avoid a duplicate order after restart", symbol, candle_ts,
+                    )
+                    return
                 logger.info(
                     "%s: Short signal — %.4f > upper band %.4f (SMA %.4f, ATR %.4f, size %d)",
                     symbol, price, sig["upper"], sma, atr, size,
                 )
                 stop = self.rm.stop_price("short", price, atr)
+                self.portfolio.record_entry_signal(symbol, candle_ts, "short")
                 self._enter(symbol, "sell", "short", size, stop, est_price=price)
 
     # ------------------------------------------------------------------

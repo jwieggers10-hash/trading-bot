@@ -49,6 +49,10 @@ class Portfolio:
         self.stop_order_ids: dict[str, str] = {}
         # symbol -> UTC datetime of last stop-out (for re-entry cooldown)
         self._stop_out_times: dict[str, datetime] = {}
+        # symbol -> "candle_ts|direction" of the most recent entry attempt,
+        # so a restart cannot re-process the same candle's signal (see
+        # entry_signal_already_processed / record_entry_signal below).
+        self.last_entry_signal: dict[str, str] = {}
 
         self._load_state()
         self._reconcile_with_broker()
@@ -78,6 +82,8 @@ class Portfolio:
                     dt = dt.replace(tzinfo=timezone.utc)
                 self._stop_out_times[sym] = dt
 
+            self.last_entry_signal = dict(data.get("last_entry_signal", {}))
+
             logger.info(
                 "Loaded position state from %s: %d open position(s), %d cooldown(s)",
                 self._state_file, len(self.entry_prices), len(self._stop_out_times),
@@ -103,6 +109,7 @@ class Portfolio:
                     sym: dt.isoformat()
                     for sym, dt in self._stop_out_times.items()
                 },
+                "last_entry_signal": dict(self.last_entry_signal),
             }
             with open(self._state_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
@@ -241,6 +248,36 @@ class Portfolio:
             return False
         elapsed = (datetime.now(timezone.utc) - dt).total_seconds()
         return elapsed < STOP_COOLDOWN_SECONDS
+
+    # ------------------------------------------------------------------
+    # Restart-safe entry dedup
+    #
+    # main.py's per-strategy interval timer (last_mean_rev etc.) is an
+    # in-memory float that resets to 0 on every process start, so a restart
+    # immediately re-evaluates every symbol's latest candle regardless of how
+    # much of that candle's interval had already elapsed. position_state()
+    # is a live broker query, so a restart alone cannot duplicate an entry
+    # once the position is visible on Alpaca — but there is a real window
+    # between submit_order() returning and that fill becoming visible via
+    # list_positions(). A crash inside that window followed by an immediate
+    # restart would otherwise see the symbol as still "flat" and could submit
+    # a second market order for the same signal, doubling the position.
+    #
+    # record_entry_signal() must be called BEFORE submit_order() so the flag
+    # is durable on disk before the network call — that's what closes the
+    # race rather than just narrowing it.
+    # ------------------------------------------------------------------
+
+    def entry_signal_already_processed(self, symbol: str, candle_ts, direction: str) -> bool:
+        """Return True if an entry was already attempted for this exact
+        (candle, direction) on *symbol*, including in a prior process
+        lifetime (this is loaded from disk)."""
+        return self.last_entry_signal.get(symbol) == f"{candle_ts}|{direction}"
+
+    def record_entry_signal(self, symbol: str, candle_ts, direction: str) -> None:
+        """Persist that an entry is about to be attempted for (candle, direction)."""
+        self.last_entry_signal[symbol] = f"{candle_ts}|{direction}"
+        self._save_state()
 
     # ------------------------------------------------------------------
     # Correlation filter
