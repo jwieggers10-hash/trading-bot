@@ -87,6 +87,10 @@ class MomentumBreakoutStrategy:
         is_long = self.portfolio.is_long(SYMBOL)
         is_short = self.portfolio.is_short(SYMBOL)
 
+        if not is_long and not is_short:
+            if self.portfolio.recover_external_exit(SYMBOL, current_price):
+                return
+
         # --- Update and check trailing stop ---
         if is_long:
             self.portfolio.update_trailing_stop(SYMBOL, current_price, atr, MOMENTUM_TRAILING_ATR, "long")

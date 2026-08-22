@@ -24,10 +24,15 @@ from config import STOP_COOLDOWN_SECONDS
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_position(symbol: str, qty: float):
+def _make_position(symbol: str, qty: float, avg_entry_price: float = 0.0):
     pos = MagicMock()
     pos.symbol = symbol
     pos.qty = str(qty)
+    # Explicit default (not a bare MagicMock) — MagicMock's default __float__
+    # returns 1.0, which reconcile_and_correct() would otherwise see as real
+    # broker price drift against any nonzero local entry_price and "correct"
+    # local state to a bogus $1.00, breaking tests that don't care about price.
+    pos.avg_entry_price = str(avg_entry_price)
     return pos
 
 
@@ -290,7 +295,7 @@ class TestPositionStatePersistence:
             },
             "stop_cooldowns": {},
         }))
-        api.list_positions.return_value = [_make_position("SPY", 136)]
+        api.list_positions.return_value = [_make_position("SPY", 136, avg_entry_price=520.0)]
 
         with patch.object(Portfolio, "_init_log_files"):
             p2 = Portfolio(api, state_file=str(state_file))
@@ -320,7 +325,15 @@ class TestPositionStatePersistence:
 
         assert "SPY" not in p.entry_prices
 
-    def test_reconcile_clears_direction_mismatch(self, api, tmp_path):
+    def test_reconcile_clears_direction_mismatch_then_rebuilds_from_broker_truth(self, api, tmp_path):
+        """A direction mismatch means the locally-recorded entry (long,
+        520.0, 136 shares, stop-1) cannot be trusted — it's cleared. But the
+        broker still shows a real, live short position underneath it, so it
+        must not be left completely untracked afterward (no stop-loss/SMA
+        awareness until a manual restart, per the old behavior); it's
+        immediately rebuilt from broker truth instead. Since no stop order is
+        mocked as live for it, the rebuilt trailing_stop is the entry-price
+        placeholder — flagged, not a real risk-managed level."""
         state_file = tmp_path / "state.json"
         state_file.write_text(json.dumps({
             "positions": {
@@ -332,13 +345,20 @@ class TestPositionStatePersistence:
             },
             "stop_cooldowns": {},
         }))
-        # Alpaca shows SPY as short (direction mismatch)
-        api.list_positions.return_value = [_make_position("SPY", -50)]
+        # Alpaca shows SPY as short (direction mismatch) at a different price.
+        api.list_positions.return_value = [_make_position("SPY", -50, avg_entry_price=505.0)]
+        api.list_orders.return_value = []  # no live stop order found on rebuild
 
         with patch.object(Portfolio, "_init_log_files"):
             p = Portfolio(api, state_file=str(state_file))
 
-        assert "SPY" not in p.entry_prices
+        # The stale long-136-at-520 record is gone...
+        assert p.stop_order_ids.get("SPY") != "stop-1"
+        # ...replaced by broker truth, not left untracked.
+        assert p.entry_directions.get("SPY") == "short"
+        assert p.entry_sizes.get("SPY") == 50
+        assert p.entry_prices.get("SPY") == 505.0
+        assert p.stop_order_ids.get("SPY") == ""  # no live stop found — unverified placeholder
 
     def test_reconcile_skipped_gracefully_when_api_fails(self, api, tmp_path):
         state_file = tmp_path / "state.json"

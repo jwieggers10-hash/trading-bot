@@ -99,6 +99,10 @@ class TrendFollowingStrategy:
         is_long = self.portfolio.is_long(symbol)
         is_short = self.portfolio.is_short(symbol)
 
+        if not is_long and not is_short:
+            if self.portfolio.recover_external_exit(symbol, current_price):
+                return
+
         # --- Update and check trailing stop ---
         if is_long:
             self.portfolio.update_trailing_stop(symbol, current_price, atr, TREND_TRAILING_ATR, "long")

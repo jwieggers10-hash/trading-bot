@@ -105,6 +105,10 @@ class MeanReversionStrategy:
         is_long = pos_state == "long"
         is_short = pos_state == "short"
 
+        if not is_long and not is_short:
+            if self.portfolio.recover_external_exit(symbol, price):
+                return
+
         # --- Check trailing/hard stop first ---
         if (is_long or is_short) and self.portfolio.trailing_stop_triggered(symbol, price):
             direction = "long" if is_long else "short"
@@ -237,11 +241,21 @@ def _flatten(bars_df: pd.DataFrame, symbol: str) -> pd.DataFrame:
 
 def _wait_for_fill(
     order, api, symbol: str, timeout: float = 10.0, poll_interval: float = 0.5
-) -> object:
-    """Poll until *order* is filled (or terminal) or *timeout* seconds pass.
+) -> tuple:
+    """Poll until *order* reaches a terminal status or *timeout* seconds pass.
 
-    Returns the most recently fetched order object, so callers get an
-    accurate filled_qty / filled_avg_price for record-keeping.
+    Returns (order, settled). *order* is the most recently fetched order
+    object; *settled* is True only when a terminal status was actually
+    observed within the timeout.
+
+    Callers must NOT treat filled_qty as final when settled is False.
+    Alpaca's paper-trading engine can keep filling a market order well past
+    this poll window — an in-flight snapshot (e.g. status="partially_filled"
+    or "new") is not the final truth. Recording it as final can permanently
+    freeze a stale, too-small quantity into local bookkeeping while the
+    broker-side position keeps growing underneath it. Unsettled orders must
+    instead be reconciled directly against the live broker position
+    (see Portfolio.reconcile_position_with_broker).
     """
     _TERMINAL = frozenset({"filled", "canceled", "expired", "rejected", "done_for_day"})
     deadline = time.monotonic() + timeout
@@ -249,14 +263,17 @@ def _wait_for_fill(
         raw = getattr(order, "status", None)
         status_str = (raw.value if hasattr(raw, "value") else str(raw)).lower()
         if status_str in _TERMINAL:
-            return order
+            return order, True
         time.sleep(poll_interval)
         try:
             order = api.get_order(order.id)
         except Exception:
-            return order
-    logger.warning("%s: _wait_for_fill timed out after %.0fs — proceeding anyway", symbol, timeout)
-    return order
+            return order, False
+    logger.warning(
+        "%s: _wait_for_fill timed out after %.0fs — order %s not yet settled (status=%s)",
+        symbol, timeout, getattr(order, "id", "?"), getattr(order, "status", None),
+    )
+    return order, False
 
 
 def _fill_price(order, api, symbol: str) -> float:
@@ -303,7 +320,11 @@ def _find_child_stop_id(order, api, symbol: str, stop_side: str) -> str | None:
             raw_side = getattr(leg, "side", None)
             leg_side = (raw_side.value if hasattr(raw_side, "value") else str(raw_side)).lower()
             if leg_type in ("stop", "stop_limit") and leg_side == stop_side:
-                return leg.id
+                # alpaca-py types Order.id as uuid.UUID. Cast to str immediately —
+                # this value flows straight into Portfolio.stop_order_ids and then
+                # json.dump() in _save_state(), which raises on a raw UUID and
+                # (before this fix) left position_state.json truncated/corrupt.
+                return str(leg.id)
         return None
 
     stop_id = _search(order)
@@ -369,9 +390,39 @@ def _submit_protected_entry(
 
     notifier.trade_entry_submitted(symbol, side, size, est_price)
 
-    order = _wait_for_fill(order, api, symbol)
-    filled = _filled_qty(order, size)
-    entry_price = _fill_price(order, api, symbol)
+    order, settled = _wait_for_fill(order, api, symbol)
+
+    if settled:
+        filled = _filled_qty(order, size)
+        entry_price = _fill_price(order, api, symbol)
+    else:
+        logger.warning(
+            "%s: Entry order %s not settled after wait (status=%s, last-seen "
+            "filled_qty=%s) — reconciling against the live broker position instead "
+            "of trusting the in-flight snapshot.",
+            symbol, order.id, getattr(order, "status", None), getattr(order, "filled_qty", None),
+        )
+        broker_state = portfolio.reconcile_position_with_broker(symbol)
+        if broker_state is None:
+            logger.error(
+                "%s: Order %s is still unsettled and the broker shows no open "
+                "position for it yet — not recording a local entry now. If the "
+                "order goes on to fill, broker reconciliation will pick it up so "
+                "the bot does not silently misrecord the position.",
+                symbol, order.id,
+            )
+            return None
+        filled = (
+            int(broker_state["qty"]) if isinstance(size, int)
+            else round(broker_state["qty"], 6)
+        )
+        entry_price = broker_state["avg_price"]
+        logger.info(
+            "%s: Reconciled unsettled order %s against broker position — "
+            "qty=%s avg_price=%.4f (originally requested %s)",
+            symbol, order.id, filled, entry_price, size,
+        )
+
     if entry_price <= 0:
         # Alpaca paper-trading returns orders before they settle; filled_avg_price is
         # sometimes None and get_latest_trade may also fail.  Fall back to the signal

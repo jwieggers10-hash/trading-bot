@@ -175,6 +175,21 @@ class TestWithinProcessDedup:
         assert api.submit_order.call_count == 1
 
     def test_next_candle_is_allowed(self, api, rm, tmp_path):
+        """A genuinely new candle must still be tradeable after a position
+        was closed through the bot's own normal path (SMA exit / hard stop —
+        both call Portfolio.clear_position()).
+
+        This is deliberately NOT simulated by leaving api.list_positions() at
+        [] with the local entry still tracked: that combination is
+        indistinguishable from an external exit (e.g. the broker-side stop
+        firing while the bot wasn't looking), and Portfolio.recover_external_exit()
+        now — correctly, by design — treats any such transition as a stop-out
+        and applies the re-entry cooldown (see TestExternalExitDefersReentry
+        below for the dedicated test of that behavior). This test simulates a
+        clean, already-closed position instead, so it actually exercises what
+        it's meant to: the entry_signal_already_processed() guard allowing a
+        fresh candle through, not the external-exit/cooldown path.
+        """
         with patch.object(Portfolio, "_init_log_files"):
             portfolio = Portfolio(api, state_file=str(tmp_path / "state.json"))
         strategy = MeanReversionStrategy(api, rm, portfolio)
@@ -186,9 +201,10 @@ class TestWithinProcessDedup:
              patch.object(strategy, "_signals", return_value=_LONG_SIGNAL):
             strategy.run("SPY")
 
-        # Position now open in the mock broker → second tick would normally
-        # skip entry anyway; instead simulate: position was closed again and
-        # a fresh candle 15 minutes later has the same long signal.
+        # Position closed through the bot's own normal path (not externally) —
+        # broker is flat AND local tracking has already been cleared, so the
+        # next tick sees a clean flat state rather than an unexplained one.
+        portfolio.clear_position("SPY")
         api.list_positions.return_value = []
         bars2 = _make_df_bars(last_ts="2026-01-01 10:15")
         with patch.object(strategy, "_get_bars", return_value=bars2), \
@@ -245,7 +261,16 @@ class TestRestartDedup:
 
     def test_restart_on_a_new_candle_still_trades(self, api, rm, tmp_path):
         """The guard must not become a permanent block — a genuinely new
-        candle after restart must still be tradeable."""
+        candle after restart must still be tradeable.
+
+        Like test_next_candle_is_allowed above, the position must be closed
+        through the bot's own normal path before "restart" so the persisted
+        state file has no stale open-position record for SPY. If it did,
+        portfolio2's startup reconciliation would (correctly) treat a
+        tracked-but-broker-flat SPY as an external exit / stop-out and defer
+        re-entry via the cooldown — a different, deliberately-tested behavior
+        (see TestExternalExitDefersReentry), not what this test is about.
+        """
         state_file = str(tmp_path / "state.json")
 
         with patch.object(Portfolio, "_init_log_files"):
@@ -259,6 +284,9 @@ class TestRestartDedup:
         with patch.object(strategy1, "_get_bars", return_value=bars1), \
              patch.object(strategy1, "_signals", return_value=_LONG_SIGNAL):
             strategy1.run("SPY")
+
+        # Position closed through the bot's own normal path before "restart".
+        portfolio1.clear_position("SPY")
 
         with patch.object(Portfolio, "_init_log_files"):
             portfolio2 = Portfolio(api, state_file=state_file)
@@ -321,3 +349,90 @@ class TestRestartDedup:
             strategy.run("SPY")
 
         api.submit_order.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# TestExternalExitDefersReentry — the deliberate design decision behind
+# Portfolio.recover_external_exit()
+#
+# Decision: when a symbol is tracked locally as open but the broker reports
+# it flat with no local record of the bot's own close() path having run, the
+# safest assumption is that the broker-side hard stop fired externally (it
+# fills the instant price crosses it, faster than the bot's own poll-interval
+# check can ever react — see recover_external_exit()'s docstring in
+# portfolio.py). recover_external_exit() therefore always calls
+# record_stop_out() (starting the standard STOP_COOLDOWN_SECONDS cooldown)
+# before clearing local state, and run() returns immediately after — it does
+# NOT fall through to same-tick re-entry evaluation.
+#
+# This was evaluated against the alternative (fall through to same-tick
+# entry evaluation) and rejected: even without the early return, the
+# just-started cooldown would block re-entry anyway via in_stop_cooldown(),
+# so removing the return buys nothing while making the control flow harder
+# to reason about. Treating every unexplained external flat-transition as a
+# stop-out — never as a silent "someone closed it, no cooldown needed" — is
+# consistent with how every other stop-out in this codebase is handled, and
+# errs toward not immediately re-risking capital on a symbol that may have
+# just been stopped out by real, adverse price action.
+# ---------------------------------------------------------------------------
+
+class TestExternalExitDefersReentry:
+    def test_external_exit_starts_cooldown_and_blocks_same_tick_reentry(self, api, rm, tmp_path):
+        """A symbol tracked locally as open, found flat on the broker with no
+        local record of a normal close, must not re-enter on the very same
+        tick even if the current candle's signal would otherwise trigger one."""
+        with patch.object(Portfolio, "_init_log_files"):
+            portfolio = Portfolio(api, state_file=str(tmp_path / "state.json"))
+        strategy = MeanReversionStrategy(api, rm, portfolio)
+
+        portfolio.record_entry("SPY", "long", 520.0, 35, "stop-spy", 518.0)
+        api.list_positions.return_value = []  # broker shows flat — never told the bot why
+
+        bars = _make_df_bars(last_ts="2026-01-01 10:00")
+        with patch.object(strategy, "_get_bars", return_value=bars), \
+             patch.object(strategy, "_signals", return_value=_LONG_SIGNAL):
+            strategy.run("SPY")
+
+        api.submit_order.assert_not_called()
+        assert portfolio.in_stop_cooldown("SPY") is True
+        assert "SPY" not in portfolio.entry_prices
+
+    def test_external_exit_blocks_reentry_on_the_very_next_candle_too(self, api, rm, tmp_path):
+        """The deferral isn't just same-tick — the cooldown persists across
+        the next candle as well, exactly like a real stop-out."""
+        with patch.object(Portfolio, "_init_log_files"):
+            portfolio = Portfolio(api, state_file=str(tmp_path / "state.json"))
+        strategy = MeanReversionStrategy(api, rm, portfolio)
+
+        portfolio.record_entry("SPY", "long", 520.0, 35, "stop-spy", 518.0)
+        api.list_positions.return_value = []
+
+        bars1 = _make_df_bars(last_ts="2026-01-01 10:00")
+        with patch.object(strategy, "_get_bars", return_value=bars1), \
+             patch.object(strategy, "_signals", return_value=_LONG_SIGNAL):
+            strategy.run("SPY")
+
+        bars2 = _make_df_bars(last_ts="2026-01-01 10:15")
+        with patch.object(strategy, "_get_bars", return_value=bars2), \
+             patch.object(strategy, "_signals", return_value=_LONG_SIGNAL):
+            strategy.run("SPY")
+
+        # Cooldown (60 min by default) spans well past one 15-min candle.
+        api.submit_order.assert_not_called()
+
+    def test_v2_external_exit_also_defers_reentry(self, api, rm_v2, tmp_path):
+        """Same guarantee for MeanReversionV2."""
+        with patch.object(Portfolio, "_init_log_files"):
+            portfolio = Portfolio(api, state_file=str(tmp_path / "state.json"))
+        strategy = MeanReversionV2(api, rm_v2, portfolio)
+
+        portfolio.record_entry("SPY", "long", 520.0, 35, "stop-spy", 518.0)
+        api.list_positions.return_value = []
+
+        bars = _make_df_bars(last_ts="2026-01-01 10:00")
+        with patch.object(strategy, "_get_bars", return_value=bars), \
+             patch.object(strategy, "_signals", return_value=_LONG_SIGNAL):
+            strategy.run("SPY")
+
+        api.submit_order.assert_not_called()
+        assert portfolio.in_stop_cooldown("SPY") is True

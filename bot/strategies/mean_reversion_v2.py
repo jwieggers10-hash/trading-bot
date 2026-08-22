@@ -132,6 +132,10 @@ class MeanReversionV2:
         is_long  = pos_state == "long"
         is_short = pos_state == "short"
 
+        if not is_long and not is_short:
+            if self.portfolio.recover_external_exit(symbol, price):
+                return
+
         # --- Hard stop check ---
         if (is_long or is_short) and self.portfolio.trailing_stop_triggered(symbol, price):
             direction = "long" if is_long else "short"
